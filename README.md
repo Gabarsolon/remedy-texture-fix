@@ -4,7 +4,7 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 
 | Game | Add-on | Download | Played on |
 |---|---|---|---|
-| Control Resonant | `CRStreamingFix.addon64` | [v1.1.1](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.1.1) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
+| Control Resonant | `CRStreamingFix.addon64` | [v1.2.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.2.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
 | Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
 | Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
@@ -54,7 +54,7 @@ The panel needs a ReShade build that carries ImGui 1.92.5, such as 6.8.0. On oth
 
 ## Settings
 
-The panel and `CRStreamingFix.ini` hold the same four settings. The ini is re-read while the game runs, so editing it by hand works too.
+The panel and `CRStreamingFix.ini` hold the same settings. The ini is re-read while the game runs, so editing it by hand works too.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -62,6 +62,21 @@ The panel and `CRStreamingFix.ini` hold the same four settings. The ini is re-re
 | `MaxPoolMB` | 0 | Pool ceiling. 0 leaves the game's value. |
 | `BiasLimit` | -1 | Largest mip bias the streamer may add. -1 leaves the game's 10. |
 | `LogIntervalSec` | 5 | Seconds between stats lines. 0 turns them off. |
+| `ToggleKey` | None | Key that switches the fix off and on while you play, such as `F8` or `Ctrl+F8`. |
+| `ToggleMessage` | 1 | Show ON or OFF at the top of the screen for a moment when the key is used. Read when the game starts. |
+| `ToggleSound` | 0 | 1 plays two beeps when the key is used: rising for on, falling for off. |
+
+### Switching it off while playing
+
+Since CRStreamingFix v1.2.0 (the Alan Wake 2 and Control add-ons get it with their next release) the panel has a **Fix on** box and an **On/off key**. Off hands every value back to the game, so the pool shrinks again and the blur returns; on puts the floor back. Off is never saved: the fix is on whenever the game starts.
+
+The panel offers F1 to F12, Insert, Delete, Home, End, PageUp, PageDown, Pause, ScrollLock and the numpad digits, with Ctrl, Shift and Alt. In the ini, `ToggleKey` also takes a single letter or digit. The key only counts while the game window is in front, and it is read without hooking the game's input.
+
+The ON/OFF message is drawn by ReShade, so it needs the same ReShade build as the panel. It is set up when the game starts: after ticking **Message** in a session that started without it, it shows from the next start on. With the message enabled, ReShade may show a small empty window named "OSD" while one of its own messages is up, such as the one after a screenshot. That is how ReShade handles add-on text outside its menu; untick **Message** and restart the game to be rid of it.
+
+The beeps are played through the game's own audio, so they follow the game's volume.
+
+If the fix stutters for you, try a lower `MinPoolMB` before reaching for the key. The stutter comes from the pool being larger than your free VRAM, and switching the fix back on has to load the textures again.
 
 ## Tuning
 
@@ -79,11 +94,15 @@ In the test session the pool sat about 950 MB above free VRAM with no stutter re
 
 2048 suits an 8 GB card. For 6 GB, 1536 is a reasonable first guess; it has not been tested.
 
+On 4 GB, one user reports that the fix works at the default but brings stutter and input delay in combat. 2048 MB is more than such a card has free, so go lower there; 1024 is a first guess and has not been tested.
+
 Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the pool is also a hard limit on what gets loaded.
 
 ## Tested with
 
-Game 0.564.208.5 with v1.1.1, and game 0.563.737.9 with the versions before it. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel included.
+Game 0.564.208.5 with v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel and on/off key included.
+
+Game 0.564.478.0 has not been played. Its executable was checked with `build.bat test`: the add-on finds everything it needs there (fit-to-pool `exe+0x2ED93D0`, heap pointer `exe+0x5D0F2E8`, manager pointer `exe+0x5E08C30`), and the fit-to-pool code is the same as in 0.564.208.5.
 
 On game 0.564 use v1.1.1 or later. Older versions still apply the fix there, but the game update moved the fields behind "MB used" and "VRAM left for textures", so they show wrong numbers.
 

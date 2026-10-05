@@ -492,7 +492,12 @@ int wmain()
         FreeLibrary(m);
     g_bias.type = 2;
 
-    std::printf("14. Exit with the add-on loaded\n");
+    std::printf("14. On/off key\n");
+    reset_game();
+    test_toggle_key([] { return g_min.value.i[0] == 2048 && g_bias.value.f[2] == 2.0f; },
+                    [] { return g_min.value.i[0] == 100 && g_shrink.value.i[0] == 64 && g_bias.value.f[2] == 10.0f; });
+
+    std::printf("15. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

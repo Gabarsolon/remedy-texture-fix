@@ -433,7 +433,11 @@ int wmain()
     check(!loaded(), "unloads cleanly");
     g_code[0] ^= 0xFF;
 
-    std::printf("13. Exit with the add-on loaded\n");
+    std::printf("13. On/off key\n");
+    test_toggle_key([] { return g_heap_obj[1] == 2048 * MiB && g_bias_limit == 2.0f; },
+                    [] { return g_heap_obj[1] == 100 * MiB && g_bias_limit == 10.0f; });
+
+    std::printf("14. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

@@ -14,9 +14,12 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <mmsystem.h>
 #include <psapi.h>
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -45,7 +48,10 @@ constexpr uint32_t kReShadeApiVersion = 18; // accepted by ReShade 6.8; older Re
 constexpr uint64_t kMiB = 1024ull * 1024ull;
 constexpr DWORD kFirstTickMs = 1000; // ReShade loads and drops add-ons a few times at startup; skip those
 constexpr DWORD kTickMs = 250;
+constexpr DWORD kKeyTickMs = 30; // how often the on/off key is looked at
+constexpr DWORD kMessageMs = 2500; // how long "ON" / "OFF" stays on screen
 constexpr char kOverlayTitle[] = CRSF_NAME;
+constexpr char kOsdTitle[] = "OSD"; // ReShade draws overlays of this name every frame, menu open or not
 
 HMODULE g_module = nullptr;
 uintptr_t g_exe_base = 0;
@@ -53,7 +59,18 @@ char g_exe_name[64] = "";
 std::wstring g_dir; // folder of this DLL, with trailing backslash
 HANDLE g_log = INVALID_HANDLE_VALUE;
 HANDLE g_timer = nullptr;
+HANDLE g_key_timer = nullptr;
 volatile LONG g_busy = 0;
+volatile LONG g_key_busy = 0;
+volatile LONG g_paused = 0;       // the fix is switched off for now (the key, or the tab). Never saved.
+volatile LONG g_toggle_key = 0;   // Config::toggle_key, toggle_sound and toggle_message as the other threads see them
+volatile LONG g_toggle_sound = 0;
+volatile LONG g_toggle_message = 1;
+volatile LONG64 g_message_until = 0; // GetTickCount64() value up to which the on/off message is shown
+bool g_osd_registered = false;
+
+using play_sound_fn = BOOL(WINAPI *)(LPCWSTR, HMODULE, DWORD);
+play_sound_fn g_play_sound = nullptr; // winmm's PlaySoundW, if the game has winmm loaded
 volatile LONG g_located = 0;       // the backend found the game's pool, g_state.targets is final
 volatile LONG g_locate_failed = 0; // unsupported game version
 bool g_registered_with_reshade = false;
@@ -67,6 +84,9 @@ struct Config
     uint64_t max_pool_mb = 0;  // 0 = leave the game's value
     float bias_limit = -1.0f;  // < 0 = leave the game's value
     uint32_t log_interval_s = 5;
+    uint32_t toggle_key = 0;   // virtual-key code plus kKeyCtrl / kKeyShift / kKeyAlt; 0 = no key
+    bool toggle_sound = false; // two beeps when the key switches the fix
+    bool toggle_message = true; // "ON" / "OFF" on screen when the key switches the fix
 };
 
 // ---------------------------------------------------------------------------------------
@@ -178,6 +198,7 @@ struct State
     bool started = false;
     bool announce = true;      // log the limits at the next apply
     bool save_pending = false; // cfg was changed in the ReShade menu and must be written to the ini
+    bool paused = false;       // g_paused as last applied; tick thread only
     Targets targets;
     Config cfg;
     FILETIME cfg_time = {}; // tick thread only
@@ -221,6 +242,218 @@ void log_game_version(uintptr_t base, const char *exe_name)
 }
 
 // ---------------------------------------------------------------------------------------
+// the on/off key
+
+constexpr uint32_t kKeyCodeMask = 0xFF, kKeyCtrl = 0x100, kKeyShift = 0x200, kKeyAlt = 0x400;
+
+struct KeyName
+{
+    uint8_t vk;
+    const char *name;
+};
+// The keys offered in the tab. The ini also takes a single letter or digit, or a virtual-key code as a number.
+constexpr KeyName kKeyNames[] = {
+    {VK_F1, "F1"},           {VK_F2, "F2"},           {VK_F3, "F3"},
+    {VK_F4, "F4"},           {VK_F5, "F5"},           {VK_F6, "F6"},
+    {VK_F7, "F7"},           {VK_F8, "F8"},           {VK_F9, "F9"},
+    {VK_F10, "F10"},         {VK_F11, "F11"},         {VK_F12, "F12"},
+    {VK_INSERT, "Insert"},   {VK_DELETE, "Delete"},   {VK_HOME, "Home"},
+    {VK_END, "End"},         {VK_PRIOR, "PageUp"},    {VK_NEXT, "PageDown"},
+    {VK_PAUSE, "Pause"},     {VK_SCROLL, "ScrollLock"},
+    {VK_NUMPAD0, "Numpad0"}, {VK_NUMPAD1, "Numpad1"}, {VK_NUMPAD2, "Numpad2"},
+    {VK_NUMPAD3, "Numpad3"}, {VK_NUMPAD4, "Numpad4"}, {VK_NUMPAD5, "Numpad5"},
+    {VK_NUMPAD6, "Numpad6"}, {VK_NUMPAD7, "Numpad7"}, {VK_NUMPAD8, "Numpad8"},
+    {VK_NUMPAD9, "Numpad9"},
+};
+
+void key_name(uint32_t vk, char *out, size_t size)
+{
+    for (const KeyName &k : kKeyNames)
+        if (k.vk == vk)
+        {
+            std::snprintf(out, size, "%s", k.name);
+            return;
+        }
+    if (!vk)
+        std::snprintf(out, size, "None");
+    else if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        std::snprintf(out, size, "%c", static_cast<char>(vk));
+    else
+        std::snprintf(out, size, "0x%02X", vk);
+}
+
+// "Ctrl+F8", "K", "None"
+void key_text(uint32_t key, char *out, size_t size)
+{
+    char name[16];
+    key_name(key & kKeyCodeMask, name, sizeof(name));
+    std::snprintf(out, size, "%s%s%s%s", key & kKeyCtrl ? "Ctrl+" : "", key & kKeyShift ? "Shift+" : "",
+                  key & kKeyAlt ? "Alt+" : "", name);
+}
+
+uint32_t key_code(const char *name)
+{
+    for (const KeyName &k : kKeyNames)
+        if (_stricmp(k.name, name) == 0)
+            return k.vk;
+    if (name[0] && !name[1] && std::isalnum(static_cast<unsigned char>(name[0])))
+        return static_cast<uint32_t>(std::toupper(static_cast<unsigned char>(name[0])));
+    char *end = nullptr;
+    const unsigned long code = std::strtoul(name, &end, 0);
+    return end != name && *end == '\0' && code >= VK_BACK && code < 0xFF ? code : 0; // below VK_BACK: mouse buttons
+}
+
+// Anything that is not a key (including "None") gives 0.
+uint32_t parse_key(const wchar_t *text)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%ls", text);
+    uint32_t key = 0;
+    for (char *part = buf; part;)
+    {
+        char *next = std::strchr(part, '+');
+        if (next)
+            *next++ = '\0';
+        while (*part == ' ')
+            ++part;
+        for (size_t n = std::strlen(part); n && part[n - 1] == ' ';)
+            part[--n] = '\0';
+        if (_stricmp(part, "Ctrl") == 0)
+            key |= kKeyCtrl;
+        else if (_stricmp(part, "Shift") == 0)
+            key |= kKeyShift;
+        else if (_stricmp(part, "Alt") == 0)
+            key |= kKeyAlt;
+        else
+            key = (key & ~kKeyCodeMask) | key_code(part);
+        part = next;
+    }
+    return key & kKeyCodeMask ? key : 0;
+}
+
+bool key_down(int vk)
+{
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+// The key with exactly its modifiers, so that F8 does not answer to Ctrl+F8.
+bool toggle_key_down(uint32_t key)
+{
+    return key_down(static_cast<int>(key & kKeyCodeMask)) && key_down(VK_CONTROL) == ((key & kKeyCtrl) != 0) &&
+           key_down(VK_SHIFT) == ((key & kKeyShift) != 0) && key_down(VK_MENU) == ((key & kKeyAlt) != 0);
+}
+
+bool game_in_front()
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
+}
+
+// Two short tones as a WAV file in memory: 880 Hz for 70 ms, then `second_hz` for 90 ms.
+constexpr uint32_t kWavRate = 22050;
+constexpr uint32_t kWavSamples = kWavRate * 160 / 1000;
+struct Wav
+{
+    uint8_t bytes[44 + kWavSamples * 2];
+};
+
+void build_wav(Wav &wav, double second_hz)
+{
+    uint8_t *p = wav.bytes;
+    const auto put = [&p](const void *src, size_t size) {
+        std::memcpy(p, src, size);
+        p += size;
+    };
+    const auto put32 = [&put](uint32_t v) { put(&v, 4); };
+    const auto put16 = [&put](uint16_t v) { put(&v, 2); };
+    put("RIFF", 4);
+    put32(36 + kWavSamples * 2);
+    put("WAVEfmt ", 8);
+    put32(16);
+    put16(1); // PCM
+    put16(1); // mono
+    put32(kWavRate);
+    put32(kWavRate * 2);
+    put16(2);
+    put16(16);
+    put("data", 4);
+    put32(kWavSamples * 2);
+    const uint32_t first = kWavRate * 70 / 1000, fade = kWavRate * 8 / 1000;
+    for (uint32_t i = 0; i < kWavSamples; ++i)
+    {
+        const bool second = i >= first;
+        const uint32_t at = second ? i - first : i, length = second ? kWavSamples - first : first;
+        const double gain = std::min({1.0, at / static_cast<double>(fade), (length - at) / static_cast<double>(fade)});
+        const double wave = std::sin(6.283185307179586 * (second ? second_hz : 880.0) * at / kWavRate);
+        put16(static_cast<uint16_t>(static_cast<int16_t>(wave * gain * 8000.0)));
+    }
+}
+
+// Falling tones: off. Rising: on. Played through the game's own audio, so it follows the game's volume.
+// Beep() is the fallback: it belongs to Windows' system sounds, which are silent on some setups.
+void play_toggle_sound(bool now_off)
+{
+    static Wav on, off;
+    static bool built = false;
+    if (!built)
+    {
+        build_wav(on, 1175.0);
+        build_wav(off, 587.0);
+        built = true;
+    }
+    if (g_play_sound && g_play_sound(reinterpret_cast<LPCWSTR>((now_off ? off : on).bytes), nullptr,
+                                     SND_MEMORY | SND_SYNC | SND_NODEFAULT))
+        return;
+    Beep(880, 60);
+    Beep(now_off ? 587 : 1175, 90);
+}
+
+// Runs every kKeyTickMs. The key is polled, not hooked: nothing of the game's input is touched. It only
+// flips g_paused; the next tick applies it.
+VOID CALLBACK key_tick(PVOID, BOOLEAN)
+{
+    if (InterlockedCompareExchange(&g_key_busy, 1, 0) != 0)
+        return; // the sound of the last press is still playing
+
+    static bool was_down = false;
+    const uint32_t key = static_cast<uint32_t>(g_toggle_key);
+    const bool down = key && g_located && toggle_key_down(key) && game_in_front();
+    if (down && !was_down)
+    {
+        const bool now_off = InterlockedExchange(&g_paused, g_paused ? 0 : 1) == 0;
+        InterlockedExchange64(&g_message_until, static_cast<LONG64>(GetTickCount64() + kMessageMs));
+        if (g_toggle_sound)
+            play_toggle_sound(now_off);
+    }
+    was_down = down;
+
+    InterlockedExchange(&g_key_busy, 0);
+}
+
+// Called by ReShade every frame, with its menu open or closed. Shows "ON" / "OFF" for a moment after
+// the key was used, in a small window of its own at the top of the screen.
+void draw_message(void * /*reshade::api::effect_runtime*/)
+{
+    if (!g_toggle_message || GetTickCount64() >= static_cast<ULONGLONG>(g_message_until))
+        return;
+    const bool off = g_paused != 0;
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, 2.0f * ImGui::GetFontSize()), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.75f);
+    if (ImGui::Begin(CRSF_NAME " message", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, off ? ImVec4(1.0f, 0.6f, 0.2f, 1.0f) : ImVec4(0.5f, 1.0f, 0.5f, 1.0f));
+        ImGui::TextUnformatted(off ? CRSF_NAME ": OFF" : CRSF_NAME ": ON");
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------------------
 // config
 
 std::wstring ini_path()
@@ -244,7 +477,15 @@ void write_default_ini()
         "; -1 = leave the game's value.\r\n"
         "BiasLimit=-1\r\n"
         "; Seconds between stats lines in " CRSF_NAME ".log. 0 = off.\r\n"
-        "LogIntervalSec=5\r\n";
+        "LogIntervalSec=5\r\n"
+        "; Key that switches the fix off and on while playing, e.g. F8 or Ctrl+F8. None = no key.\r\n"
+        "; Off lasts until the key is pressed again; the fix is always on when the game starts.\r\n"
+        "ToggleKey=None\r\n"
+        "; 1 = show ON / OFF on screen for a moment when the key is used. 0 = no message.\r\n"
+        "; Read when the game starts: switching it on later needs a restart of the game.\r\n"
+        "ToggleMessage=1\r\n"
+        "; 1 = two beeps when the key is used (rising: on, falling: off). 0 = silent.\r\n"
+        "ToggleSound=0\r\n";
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return;
@@ -264,6 +505,10 @@ Config read_config()
     wchar_t buf[64] = {};
     GetPrivateProfileStringW(CRSF_NAME_W, L"BiasLimit", L"-1", buf, 64, path.c_str());
     c.bias_limit = static_cast<float>(std::wcstod(buf, nullptr));
+    GetPrivateProfileStringW(CRSF_NAME_W, L"ToggleKey", L"None", buf, 64, path.c_str());
+    c.toggle_key = parse_key(buf);
+    c.toggle_sound = GetPrivateProfileIntW(CRSF_NAME_W, L"ToggleSound", 0, path.c_str()) != 0;
+    c.toggle_message = GetPrivateProfileIntW(CRSF_NAME_W, L"ToggleMessage", 1, path.c_str()) != 0;
     if (c.min_pool_mb > 16384)
         c.min_pool_mb = 16384;
     if (c.max_pool_mb > 16384)
@@ -292,6 +537,12 @@ void write_config(const Config &c)
     WritePrivateProfileStringW(CRSF_NAME_W, L"BiasLimit", buf, path.c_str());
     std::swprintf(buf, 32, L"%u", c.log_interval_s);
     WritePrivateProfileStringW(CRSF_NAME_W, L"LogIntervalSec", buf, path.c_str());
+    char key[32];
+    key_text(c.toggle_key, key, sizeof(key));
+    std::swprintf(buf, 32, L"%hs", key);
+    WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleKey", buf, path.c_str());
+    WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleSound", c.toggle_sound ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleMessage", c.toggle_message ? L"1" : L"0", path.c_str());
 }
 
 FILETIME ini_time()
@@ -306,8 +557,19 @@ void log_config(const char *what, const Config &c)
     char max_pool[40] = "";
     if constexpr (kHasMaxPool)
         std::snprintf(max_pool, sizeof(max_pool), " MaxPoolMB=%llu", static_cast<unsigned long long>(c.max_pool_mb));
-    log_line("%s: MinPoolMB=%llu%s BiasLimit=%.2f LogIntervalSec=%u", what,
-             static_cast<unsigned long long>(c.min_pool_mb), max_pool, c.bias_limit, c.log_interval_s);
+    char key[32];
+    key_text(c.toggle_key, key, sizeof(key));
+    log_line("%s: MinPoolMB=%llu%s BiasLimit=%.2f LogIntervalSec=%u ToggleKey=%s", what,
+             static_cast<unsigned long long>(c.min_pool_mb), max_pool, c.bias_limit, c.log_interval_s, key);
+}
+
+// What "off" applies: every value left to the game.
+Config game_values(Config c)
+{
+    c.min_pool_mb = 0;
+    c.max_pool_mb = 0;
+    c.bias_limit = -1.0f;
+    return c;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -364,9 +626,20 @@ VOID CALLBACK tick(PVOID, BOOLEAN)
             s.cfg = from_file;
             s.announce = true;
         }
+        const bool paused = g_paused != 0;
+        if (paused != s.paused)
+        {
+            s.paused = paused;
+            s.announce = true;
+            log_line(paused ? "Switched off: the game's own values are back until it is switched on again."
+                            : "Switched on.");
+        }
         const Config cfg = s.cfg;
-        apply(s.targets, s.cfg, s.base, s.announce);
+        apply(s.targets, paused ? game_values(cfg) : cfg, s.base, s.announce);
         ReleaseSRWLockExclusive(&g_lock);
+        InterlockedExchange(&g_toggle_key, static_cast<LONG>(cfg.toggle_key));
+        InterlockedExchange(&g_toggle_sound, cfg.toggle_sound ? 1 : 0);
+        InterlockedExchange(&g_toggle_message, cfg.toggle_message ? 1 : 0);
 
         if (save)
         {
@@ -449,13 +722,26 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
     }
 
     ImGui::PushTextWrapPos(0.0f); // wrap text lines at the window edge instead of clipping them
+    const bool paused = g_paused != 0;
     ImGui::SeparatorText("Right now");
+    if (paused)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.2f, 1.0f));
+        ImGui::TextUnformatted("The fix is switched off. The game's own values are in use.");
+        ImGui::PopStyleColor();
+    }
     draw_status(read_live(s.targets));
 
     ImGui::SeparatorText("Settings");
     bool changed = false, released = false;
     char text[192];
     char format[64];
+
+    bool fix_on = !paused;
+    if (ImGui::Checkbox("Fix on", &fix_on))
+        InterlockedExchange(&g_paused, fix_on ? 0 : 1);
+    tooltip("Switch the fix off to compare, or for a part of the game where it stutters. This is not saved: "
+            "the fix is on again the next time the game starts.");
 
     int min_mb = static_cast<int>(ui_cfg.min_pool_mb);
     if (min_mb)
@@ -520,9 +806,64 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
     released |= ImGui::IsItemDeactivatedAfterEdit();
     tooltip("Seconds between stats lines in " CRSF_NAME ".log.");
 
+    const uint32_t vk = ui_cfg.toggle_key & kKeyCodeMask;
+    key_name(vk, text, sizeof(text));
+    if (ImGui::BeginCombo("On/off key", text))
+    {
+        if (ImGui::Selectable("None", vk == 0))
+        {
+            ui_cfg.toggle_key = 0;
+            changed = released = true;
+        }
+        for (const KeyName &k : kKeyNames)
+            if (ImGui::Selectable(k.name, k.vk == vk))
+            {
+                ui_cfg.toggle_key = (ui_cfg.toggle_key & ~kKeyCodeMask) | k.vk;
+                changed = released = true;
+            }
+        ImGui::EndCombo();
+    }
+    tooltip("A key that switches the fix off and on while you play, the same as \"Fix on\" above. "
+            "A letter or digit key can be set as ToggleKey in " CRSF_NAME ".ini.");
+    if (vk)
+    {
+        const struct
+        {
+            const char *label;
+            uint32_t bit;
+        } modifiers[] = {{"Ctrl", kKeyCtrl}, {"Shift", kKeyShift}, {"Alt", kKeyAlt}};
+        for (const auto &modifier : modifiers)
+        {
+            bool held = (ui_cfg.toggle_key & modifier.bit) != 0;
+            if (ImGui::Checkbox(modifier.label, &held))
+            {
+                ui_cfg.toggle_key ^= modifier.bit;
+                changed = released = true;
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Checkbox("Message", &ui_cfg.toggle_message))
+            changed = released = true;
+        tooltip("Show ON or OFF at the top of the screen for a moment when the key is used.");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Beep", &ui_cfg.toggle_sound))
+            changed = released = true;
+        tooltip("Two beeps when the key is used: rising for on, falling for off.");
+        if (ui_cfg.toggle_message && !g_osd_registered)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+            ImGui::TextUnformatted("The message is set up when the game starts. It will show from the next start on.");
+            ImGui::PopStyleColor();
+        }
+    }
+
     if (ImGui::Button("Defaults"))
     {
+        const Config old = ui_cfg;
         ui_cfg = Config();
+        ui_cfg.toggle_key = old.toggle_key; // the key is not one of the values the button is about
+        ui_cfg.toggle_sound = old.toggle_sound;
+        ui_cfg.toggle_message = old.toggle_message;
         changed = released = true;
     }
     tooltip("Minimum 2048 MB, everything else left to the game.");
@@ -574,6 +915,15 @@ void register_overlay(HMODULE reshade)
     imgui_function_table_instance() = table;
     reg(kOverlayTitle, &draw_overlay);
     g_overlay_registered = g_has_tab = true;
+
+    // The on/off message. Overlays can only be registered here, at load, so the setting is read early.
+    // With it off nothing is registered: ReShade shows an "OSD" overlay as a small window of that name
+    // while one of its own messages is up (after a screenshot, for one), and nobody should get that unasked.
+    if (GetPrivateProfileIntW(CRSF_NAME_W, L"ToggleMessage", 1, ini_path().c_str()) != 0)
+    {
+        reg(kOsdTitle, &draw_message);
+        g_osd_registered = true;
+    }
 }
 
 void unregister_overlay(HMODULE reshade)
@@ -581,8 +931,26 @@ void unregister_overlay(HMODULE reshade)
     if (!g_overlay_registered)
         return;
     if (const auto unreg = reinterpret_cast<overlay_fn>(GetProcAddress(reshade, "ReShadeUnregisterOverlay")))
+    {
         unreg(kOverlayTitle, &draw_overlay);
-    g_overlay_registered = false;
+        if (g_osd_registered)
+            unreg(kOsdTitle, &draw_message);
+    }
+    g_overlay_registered = g_osd_registered = false;
+}
+
+// winmm's PlaySoundW, for the on/off sound. Only the real winmm in the Windows folder counts, never a
+// winmm.dll next to the game (a mod loader's or upscaler's stand-in), and nothing is loaded for it.
+// Asks the loader, so only for DllMain.
+play_sound_fn find_play_sound()
+{
+    wchar_t path[MAX_PATH + 16];
+    const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return nullptr;
+    wcscpy_s(path + length, MAX_PATH + 16 - length, L"\\winmm.dll");
+    const HMODULE winmm = GetModuleHandleW(path);
+    return winmm ? reinterpret_cast<play_sound_fn>(GetProcAddress(winmm, "PlaySoundW")) : nullptr;
 }
 
 bool process_is_exiting()
@@ -594,23 +962,23 @@ bool process_is_exiting()
     return false;
 }
 
-void stop_timer()
+void stop_timer(HANDLE &timer)
 {
-    if (!g_timer)
+    if (!timer)
         return;
     // Wait for a running tick to finish before the DLL goes away. Ticks never need the loader lock.
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (done)
     {
-        if (DeleteTimerQueueTimer(nullptr, g_timer, done) || GetLastError() == ERROR_IO_PENDING)
+        if (DeleteTimerQueueTimer(nullptr, timer, done) || GetLastError() == ERROR_IO_PENDING)
             WaitForSingleObject(done, 5000);
         CloseHandle(done);
     }
     else
     {
-        DeleteTimerQueueTimer(nullptr, g_timer, INVALID_HANDLE_VALUE);
+        DeleteTimerQueueTimer(nullptr, timer, INVALID_HANDLE_VALUE);
     }
-    g_timer = nullptr;
+    timer = nullptr;
 }
 } // namespace
 
@@ -652,8 +1020,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
 
         on_attach();
+        g_play_sound = find_play_sound();
         if (!CreateTimerQueueTimer(&g_timer, nullptr, tick, nullptr, kFirstTickMs, kTickMs, WT_EXECUTEDEFAULT))
             g_timer = nullptr;
+        if (!CreateTimerQueueTimer(&g_key_timer, nullptr, key_tick, nullptr, kFirstTickMs, kKeyTickMs, WT_EXECUTEDEFAULT))
+            g_key_timer = nullptr;
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -664,7 +1035,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         HMODULE reshade = g_registered_with_reshade ? find_reshade() : nullptr;
         if (reshade)
             unregister_overlay(reshade); // no more draw_overlay calls after this
-        stop_timer();
+        stop_timer(g_key_timer);
+        stop_timer(g_timer);
         if (reshade)
         {
             using unregister_fn = void(__cdecl *)(HMODULE);

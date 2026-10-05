@@ -55,7 +55,7 @@ goto next_exe
 rem :addon <name> [define]
 :addon
 rc /nologo %~2 /fo build\%1.res src\CRStreamingFix.rc || exit /b 1
-cl %FLAGS% %~2 /LD /O2 /wd4100 src\CRStreamingFix.cpp build\%1.res /Fobuild\%1.obj /Febuild\%1.addon64 /link /DLL psapi.lib || exit /b 1
+cl %FLAGS% %~2 /LD /O2 /wd4100 src\CRStreamingFix.cpp build\%1.res /Fobuild\%1.obj /Febuild\%1.addon64 /link /DLL psapi.lib user32.lib || exit /b 1
 del build\%1.lib build\%1.exp 2>nul
 echo Built build\%1.addon64
 exit /b 0
@@ -71,7 +71,7 @@ exit /b 0
 rem :locate <name> <path to the game exe> [define]
 rem Maps the game's files and runs the add-on's lookup on them. Nothing of the game is executed.
 :locate
-cl %FLAGS% %~3 /O2 /wd4100 src\test_locate.cpp /Fobuild\test_locate_%1.obj /Febuild\test_locate_%1.exe /link psapi.lib || exit /b 1
+cl %FLAGS% %~3 /O2 /wd4100 src\test_locate.cpp /Fobuild\test_locate_%1.obj /Febuild\test_locate_%1.exe /link psapi.lib user32.lib || exit /b 1
 build\test_locate_%1.exe "%~2" || exit /b 1
 exit /b 0
 
