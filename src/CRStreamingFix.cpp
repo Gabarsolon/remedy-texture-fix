@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dxgi.h>
 #include <mmsystem.h>
 #include <psapi.h>
 #include <algorithm>
@@ -71,6 +72,13 @@ bool g_osd_registered = false;
 
 using play_sound_fn = BOOL(WINAPI *)(LPCWSTR, HMODULE, DWORD);
 play_sound_fn g_play_sound = nullptr; // winmm's PlaySoundW, if the game has winmm loaded
+
+using create_factory_fn = HRESULT(WINAPI *)(REFIID, void **);
+create_factory_fn g_create_factory = nullptr; // dxgi's CreateDXGIFactory1, if the game has dxgi loaded
+
+// Set in the first tick, before g_located: the graphics card and what the add-on starts from on it.
+uint64_t g_vram_mb = 0; // 0 = not known
+uint64_t g_default_min_mb = 2048, g_default_max_mb = 0;
 volatile LONG g_located = 0;       // the backend found the game's pool, g_state.targets is final
 volatile LONG g_locate_failed = 0; // unsupported game version
 bool g_registered_with_reshade = false;
@@ -454,6 +462,67 @@ void draw_message(void * /*reshade::api::effect_runtime*/)
 }
 
 // ---------------------------------------------------------------------------------------
+// presets by graphics card memory
+
+struct Preset
+{
+    const char *label;    // the button in the tab
+    uint32_t up_to_gb;    // cards up to this size start from it
+    uint32_t min_pool_mb;
+    uint32_t max_pool_mb; // 0 = leave the game's value
+    const char *basis;    // where the numbers come from
+};
+// Only the 8 GB row was played by the author. The others rest on what users reported, or on nothing yet.
+constexpr Preset kPresets[] = {
+    {"4 GB", 5, 1536, 0, "One user runs 1664 MB on low settings; another gets stutter in combat at 2048."},
+    {"6 GB", 7, 1792, 0, "Not tested yet: halfway between the 4 GB and 8 GB values."},
+    {"8 GB", 10, 2048, 0, "What the add-on was made and tested with, path tracing on."},
+    {"12 GB", 14, 3072, 6144, "Not tested yet: the same share of the card as on 8 GB."},
+    {"16 GB+", 0xFFFFFFFF, 4096, 8192, "One user with 16 GB runs minimum and maximum at 8192 MB."},
+};
+
+struct PoolDefaults
+{
+    uint64_t min_mb, max_mb;
+};
+
+// What a card with this much memory starts from. 0 (not known) gives the 8 GB values.
+PoolDefaults defaults_for_vram(uint64_t vram_mb)
+{
+    if (!vram_mb)
+        return {2048, 0};
+    const uint64_t gb = (vram_mb + 512) / 1024; // cards report a little less than their nominal size
+    if (gb < 4)
+        return {std::max<uint64_t>(256, vram_mb * 3 / 8 / 64 * 64), 0}; // the 4 GB preset's share of the card
+    for (const Preset &p : kPresets)
+        if (gb <= p.up_to_gb)
+            return {p.min_pool_mb, p.max_pool_mb};
+    return {2048, 0};
+}
+
+// Dedicated memory of the largest graphics card in MB, 0 if it cannot be asked. On a laptop that is the
+// discrete card, which is the one the game runs on.
+uint64_t detect_vram_mb()
+{
+    if (!g_create_factory)
+        return 0;
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(g_create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))) || !factory)
+        return 0;
+    uint64_t best = 0;
+    IDXGIAdapter1 *adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i)
+    {
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+            best = std::max<uint64_t>(best, desc.DedicatedVideoMemory / kMiB);
+        adapter->Release();
+    }
+    factory->Release();
+    return best;
+}
+
+// ---------------------------------------------------------------------------------------
 // config
 
 std::wstring ini_path()
@@ -471,6 +540,8 @@ void write_default_ini()
         "; The same settings are in the " CRSF_NAME " tab of the ReShade menu.\r\n"
         "[" CRSF_NAME "]\r\n"
         CRSF_INI_MIN_POOL
+        "; When this file is first written, the value is picked for the memory of your graphics card:\r\n"
+        "; 1536 for 4 GB, 1792 for 6 GB, 2048 for 8 GB, 3072 for 12 GB, 4096 for 16 GB and more.\r\n"
         "MinPoolMB=2048\r\n"
         CRSF_INI_MAX_POOL_BLOCK
         "; Largest mip bias the streamer may add when textures don't fit the pool (game default 10).\r\n"
@@ -492,13 +563,26 @@ void write_default_ini()
     DWORD written;
     WriteFile(h, text, sizeof(text) - 1, &written, nullptr);
     CloseHandle(h);
+
+    // The text above carries the 8 GB values; put this card's in their place.
+    wchar_t buf[32];
+    if (g_default_min_mb != 2048)
+    {
+        std::swprintf(buf, 32, L"%llu", static_cast<unsigned long long>(g_default_min_mb));
+        WritePrivateProfileStringW(CRSF_NAME_W, L"MinPoolMB", buf, path.c_str());
+    }
+    if (g_default_max_mb != 0) // stays 0 in a game without a pool ceiling of its own
+    {
+        std::swprintf(buf, 32, L"%llu", static_cast<unsigned long long>(g_default_max_mb));
+        WritePrivateProfileStringW(CRSF_NAME_W, L"MaxPoolMB", buf, path.c_str());
+    }
 }
 
 Config read_config()
 {
     const std::wstring path = ini_path();
     Config c;
-    c.min_pool_mb = GetPrivateProfileIntW(CRSF_NAME_W, L"MinPoolMB", 2048, path.c_str());
+    c.min_pool_mb = GetPrivateProfileIntW(CRSF_NAME_W, L"MinPoolMB", static_cast<INT>(g_default_min_mb), path.c_str());
     if constexpr (kHasMaxPool)
         c.max_pool_mb = GetPrivateProfileIntW(CRSF_NAME_W, L"MaxPoolMB", 0, path.c_str());
     c.log_interval_s = GetPrivateProfileIntW(CRSF_NAME_W, L"LogIntervalSec", 5, path.c_str());
@@ -593,6 +677,16 @@ VOID CALLBACK tick(PVOID, BOOLEAN)
         log_game_version(g_exe_base, g_exe_name);
         if (locate(g_exe_base, s.targets))
         {
+            g_vram_mb = detect_vram_mb();
+            const PoolDefaults defaults = defaults_for_vram(g_vram_mb);
+            g_default_min_mb = defaults.min_mb;
+            if constexpr (kHasMaxPool)
+                g_default_max_mb = defaults.max_mb;
+            if (g_vram_mb)
+                log_line("Graphics card: %llu MB of memory. A new ini starts with a minimum pool of %llu MB for it.",
+                         static_cast<unsigned long long>(g_vram_mb), static_cast<unsigned long long>(g_default_min_mb));
+            else
+                log_line("Graphics card memory not known. A new ini starts with a minimum pool of 2048 MB.");
             write_default_ini();
             s.cfg = read_config();
             s.cfg_time = ini_time();
@@ -776,6 +870,31 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
                 "It is raised to the minimum if the minimum is higher.");
     }
 
+    if (g_vram_mb)
+        std::snprintf(text, sizeof(text), "Presets by graphics card memory (yours: %llu GB):",
+                      static_cast<unsigned long long>((g_vram_mb + 512) / 1024));
+    else
+        std::snprintf(text, sizeof(text), "Presets by graphics card memory:");
+    ImGui::TextUnformatted(text);
+    for (const Preset &p : kPresets)
+    {
+        if (&p != kPresets)
+            ImGui::SameLine();
+        if (ImGui::Button(p.label))
+        {
+            ui_cfg.min_pool_mb = p.min_pool_mb;
+            if constexpr (kHasMaxPool)
+                ui_cfg.max_pool_mb = p.max_pool_mb;
+            changed = released = true;
+        }
+        int n = std::snprintf(text, sizeof(text), "Minimum pool %u MB", p.min_pool_mb);
+        if constexpr (kHasMaxPool)
+            if (p.max_pool_mb)
+                n += std::snprintf(text + n, sizeof(text) - n, ", maximum pool %u MB", p.max_pool_mb);
+        std::snprintf(text + n, sizeof(text) - n, ". %s", p.basis);
+        tooltip(text);
+    }
+
     bool limit_blur = ui_cfg.bias_limit >= 0.0f;
     if (ImGui::Checkbox("Limit blur", &limit_blur))
     {
@@ -861,12 +980,14 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
     {
         const Config old = ui_cfg;
         ui_cfg = Config();
+        ui_cfg.min_pool_mb = g_default_min_mb;
+        ui_cfg.max_pool_mb = g_default_max_mb;
         ui_cfg.toggle_key = old.toggle_key; // the key is not one of the values the button is about
         ui_cfg.toggle_sound = old.toggle_sound;
         ui_cfg.toggle_message = old.toggle_message;
         changed = released = true;
     }
-    tooltip("Minimum 2048 MB, everything else left to the game.");
+    tooltip("The preset for this graphics card, with the blur limit left to the game.");
 
     if (floating)
     {
@@ -939,18 +1060,20 @@ void unregister_overlay(HMODULE reshade)
     g_overlay_registered = g_osd_registered = false;
 }
 
-// winmm's PlaySoundW, for the on/off sound. Only the real winmm in the Windows folder counts, never a
-// winmm.dll next to the game (a mod loader's or upscaler's stand-in), and nothing is loaded for it.
-// Asks the loader, so only for DllMain.
-play_sound_fn find_play_sound()
+// A function of a Windows DLL the game has loaded: winmm's PlaySoundW for the on/off sound, dxgi's
+// CreateDXGIFactory1 to ask for the card's memory. Only the DLL in the Windows folder counts, never a file
+// of that name next to the game (a mod loader's, upscaler's or ReShade's stand-in), and nothing is loaded
+// for it. Asks the loader, so only for DllMain.
+FARPROC system_function(const wchar_t *dll, const char *name)
 {
-    wchar_t path[MAX_PATH + 16];
+    wchar_t path[MAX_PATH + 32];
     const UINT length = GetSystemDirectoryW(path, MAX_PATH);
     if (!length || length >= MAX_PATH)
         return nullptr;
-    wcscpy_s(path + length, MAX_PATH + 16 - length, L"\\winmm.dll");
-    const HMODULE winmm = GetModuleHandleW(path);
-    return winmm ? reinterpret_cast<play_sound_fn>(GetProcAddress(winmm, "PlaySoundW")) : nullptr;
+    path[length] = L'\\';
+    wcscpy_s(path + length + 1, 31, dll);
+    const HMODULE module = GetModuleHandleW(path);
+    return module ? GetProcAddress(module, name) : nullptr;
 }
 
 bool process_is_exiting()
@@ -1020,7 +1143,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
 
         on_attach();
-        g_play_sound = find_play_sound();
+        g_play_sound = reinterpret_cast<play_sound_fn>(system_function(L"winmm.dll", "PlaySoundW"));
+        g_create_factory = reinterpret_cast<create_factory_fn>(system_function(L"dxgi.dll", "CreateDXGIFactory1"));
         if (!CreateTimerQueueTimer(&g_timer, nullptr, tick, nullptr, kFirstTickMs, kTickMs, WT_EXECUTEDEFAULT))
             g_timer = nullptr;
         if (!CreateTimerQueueTimer(&g_key_timer, nullptr, key_tick, nullptr, kFirstTickMs, kKeyTickMs, WT_EXECUTEDEFAULT))

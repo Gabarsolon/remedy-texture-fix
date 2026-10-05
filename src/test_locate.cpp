@@ -2,6 +2,64 @@
 // Nothing is executed from the game.
 #include "CRStreamingFix.cpp"
 
+namespace
+{
+// What a new ini starts from, for the memory sizes cards really report, and for this machine's own card.
+bool check_card_presets()
+{
+    const struct
+    {
+        uint64_t vram_mb, min_mb, max_mb;
+    } cases[] = {{0, 2048, 0},      {1990, 704, 0},     {3962, 1536, 0},     {4096, 1536, 0},      {5980, 1792, 0},
+                 {7949, 2048, 0},   {8192, 2048, 0},    {10018, 2048, 0},    {12282, 3072, 6144},  {16311, 4096, 8192},
+                 {24564, 4096, 8192}};
+    bool ok = true;
+    for (const auto &c : cases)
+    {
+        const PoolDefaults d = defaults_for_vram(c.vram_mb);
+        if (d.min_mb != c.min_mb || d.max_mb != c.max_mb)
+        {
+            std::printf("FAIL a card with %llu MB starts at %llu/%llu MB, expected %llu/%llu\n", c.vram_mb, d.min_mb, d.max_mb,
+                        c.min_mb, c.max_mb);
+            ok = false;
+        }
+    }
+    std::printf("%s presets for card sizes from 2 to 24 GB\n", ok ? "OK  " : "FAIL");
+
+    // A first ini on a 12 GB card: the card's values replace the 8 GB ones the text is written with.
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    g_dir = temp;
+    DeleteFileW(ini_path().c_str());
+    g_default_min_mb = 3072;
+    g_default_max_mb = kHasMaxPool ? 6144 : 0;
+    write_default_ini();
+    const Config written = read_config();
+    const bool ini_ok = written.min_pool_mb == 3072 && written.max_pool_mb == g_default_max_mb &&
+                        written.bias_limit == -1.0f && written.toggle_key == 0 && written.toggle_message && !written.toggle_sound;
+    std::printf("%s a first ini on a 12 GB card starts at %llu MB, the other settings at their defaults\n",
+                ini_ok ? "OK  " : "FAIL", written.min_pool_mb);
+    DeleteFileW(ini_path().c_str());
+    g_default_min_mb = 2048;
+    g_default_max_mb = 0;
+    ok = ok && ini_ok;
+
+    // The add-on only asks a dxgi the game has already loaded. Here the test loads it.
+    wchar_t path[MAX_PATH + 16];
+    GetSystemDirectoryW(path, MAX_PATH);
+    wcscat_s(path, L"\\dxgi.dll");
+    if (LoadLibraryW(path))
+    {
+        g_create_factory = reinterpret_cast<create_factory_fn>(system_function(L"dxgi.dll", "CreateDXGIFactory1"));
+        const uint64_t vram = detect_vram_mb();
+        std::printf("%s this machine's card: %llu MB, a new ini would start at %llu MB\n", g_create_factory ? "OK  " : "FAIL",
+                    vram, defaults_for_vram(vram).min_mb);
+        ok = ok && g_create_factory;
+    }
+    return ok;
+}
+} // namespace
+
 #if defined(CRSF_BACKEND_TWEAKABLES)
 
 // Control: the add-on needs four exports of the game's DLLs and four tweakables by name. With the DLLs
@@ -76,6 +134,7 @@ int wmain(int argc, wchar_t **argv)
         std::printf("%s the renderer registers \"%s\"\n", present ? "OK  " : "FAIL", name);
         ok = ok && present;
     }
+    ok = check_card_presets() && ok;
     return ok ? 0 : 1;
 }
 
@@ -147,6 +206,7 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!known)
         std::printf("note: not a build with known addresses, nothing to compare against\n");
+    ok = check_card_presets() && ok;
     return ok ? 0 : 1;
 }
 

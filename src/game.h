@@ -28,8 +28,8 @@
 #define CRSF_NAME "CRStreamingFix"
 #define CRSF_GAME "Control Resonant"
 #define CRSF_EXE "CONTROLResonant.exe"
-#define CRSF_VERSION "1.2.0"
-#define CRSF_VERSION_NUM 1, 2, 0, 0
+#define CRSF_VERSION "1.3.0"
+#define CRSF_VERSION_NUM 1, 3, 0, 0
 #define CRSF_BACKEND_HEAP
 #endif
 

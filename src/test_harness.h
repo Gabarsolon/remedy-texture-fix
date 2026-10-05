@@ -358,6 +358,16 @@ template <typename On, typename Off> void test_toggle_key(On is_on, Off is_off)
     Sleep(450);
     check(is_on(), "and on again");
 
+    g_script.click = "4 GB";
+    frames();
+    Sleep(450);
+    check(ini_int(L"MinPoolMB") == 1536 && drew("Presets by graphics card memory:"),
+          "the 4 GB preset sets a minimum pool of 1536 MB and saves it");
+    g_script.click = "8 GB";
+    frames();
+    Sleep(450);
+    check(ini_int(L"MinPoolMB") == 2048 && is_on(), "the 8 GB preset is the tested 2048 MB");
+
     check(g_previews["On/off key"] == "F8", "the tab shows the key");
     g_script.pick = "F9";
     frames();

@@ -4,7 +4,7 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 
 | Game | Add-on | Download | Played on |
 |---|---|---|---|
-| Control Resonant | `CRStreamingFix.addon64` | [v1.2.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.2.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
+| Control Resonant | `CRStreamingFix.addon64` | [v1.3.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.3.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
 | Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
 | Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
@@ -92,15 +92,27 @@ pool 2048 MB [min 2048, max 3072] | used 1933 MB | demand 1922 MB | bias 2.30 mi
 
 In the test session the pool sat about 950 MB above free VRAM with no stutter reported, but that was a short session. If you get stutter, lower `MinPoolMB`, or free VRAM another way: frame generation, path tracing quality, render resolution.
 
-2048 suits an 8 GB card. For 6 GB, 1536 is a reasonable first guess; it has not been tested.
+### Presets by graphics card memory
 
-On 4 GB, one user reports that the fix works at the default but brings stutter and input delay in combat. 2048 MB is more than such a card has free, so go lower there; 1024 is a first guess and has not been tested.
+Since v1.3.0 the panel has a row of preset buttons, and a first run picks the one for your card by itself. An ini that already exists is left alone.
+
+| Card | Minimum pool | Maximum pool | Where the numbers come from |
+|---|---|---|---|
+| 4 GB | 1536 MB | game's | One user on an RTX 3050 4 GB runs 1664 MB on the Low preset at 1080p with DLSS Performance. Another gets stutter in combat at 2048 MB. |
+| 6 GB | 1792 MB | game's | Not tested yet: halfway between the 4 GB and 8 GB values. |
+| 8 GB | 2048 MB | game's | What the add-on was made and played with, path tracing on. |
+| 12 GB | 3072 MB | 6144 MB | Not tested yet: the same share of the card as on 8 GB. |
+| 16 GB and more | 4096 MB | 8192 MB | One user on a 16 GB card runs minimum and maximum at 8192 MB. |
+
+Treat them as starting points. How much VRAM is left for textures depends on your settings far more than on the card: path tracing, frame generation and a high render resolution all take from it. If it stutters, go down; if "VRAM left for textures" stays well above your pool, there is room to go up.
+
+A raised maximum is harmless: the game only grows the pool into VRAM that is actually free.
 
 Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the pool is also a hard limit on what gets loaded.
 
 ## Tested with
 
-Game 0.564.208.5 with v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup it has been played on, panel and on/off key included.
+Game 0.564.208.5 with v1.3.0, v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup the author has played it on, panel, on/off key and preset buttons included. On that card the add-on read 7899 MB and matched it to the 8 GB preset; writing a first ini for other card sizes is covered by the offline test only. What users report on other cards is in the preset table above.
 
 Game 0.564.478.0 has not been played. Its executable was checked with `build.bat test`: the add-on finds everything it needs there (fit-to-pool `exe+0x2ED93D0`, heap pointer `exe+0x5D0F2E8`, manager pointer `exe+0x5E08C30`), and the fit-to-pool code is the same as in 0.564.208.5.
 
