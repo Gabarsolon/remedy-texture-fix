@@ -16,6 +16,7 @@
 // game's objects. Addresses are found by signature, and it does nothing if one does not match.
 
 constexpr bool kHasMaxPool = true;
+constexpr bool kHasAuto = true;
 
 #define CRSF_INI_MIN_POOL                                                                                    \
     "; Smallest texture streaming pool in MB. The game allows 100 MB and shrinks the pool to whatever\r\n"  \
@@ -26,6 +27,15 @@ constexpr bool kHasMaxPool = true;
     "; Largest pool in MB. The game sets 1664 / 3072 / 4096 from Texture Resolution Low / Medium / High.\r\n"  \
     "; 0 = leave the game's value.\r\n"                                                                        \
     "MaxPoolMB=0\r\n"
+#define CRSF_INI_AUTO_BLOCK                                                                                     \
+    "; 1 = the add-on sets the minimum pool by itself, starting from MinPoolMB. It raises it while\r\n"        \
+    "; textures are blurred and the game's VRAM budget has room, and lowers it when the game goes further\r\n" \
+    "; over the budget than AutoOverBudgetMB. 0 = MinPoolMB is used as it is.\r\n"                             \
+    "AutoPool=0\r\n"                                                                                           \
+    "; How far over its VRAM budget the game may go in automatic mode, in MB. Windows pages that much to\r\n"  \
+    "; system RAM. Higher = sharper, and it can stutter. When this file is first written, the value is\r\n"    \
+    "; an eighth of your graphics card's memory.\r\n"                                                          \
+    "AutoOverBudgetMB=960\r\n"
 
 // Where the heap's stats object keeps the numbers shown in the log and the settings tab. Only for
 // display: the fix itself does not depend on them.
@@ -543,7 +553,27 @@ void format_left(char *out, size_t size, const Live &v)
         std::snprintf(out, size, "%llu-%llu MB", lo, hi);
 }
 
-void log_stats(const Targets &t)
+// For automatic mode: what the pool holds, and whether textures are being blurred to fit it.
+AutoSample auto_sample(const Live &v)
+{
+    AutoSample a;
+    a.valid = v.renderer && v.used_valid;
+    a.held = v.used;
+    a.starving = v.manager ? v.bias >= 0.05f : v.used / 9 >= v.pool / 10; // without the bias: 90% full
+    return a;
+}
+
+// The largest pool automatic mode may set: the maximum pool, or the minimum it starts from if that is
+// higher, as with a fixed minimum. 0 until the game's own maximum is known.
+uint64_t auto_ceiling_mb(const Config &c, const Baseline &b)
+{
+    if (!b.valid)
+        return 0;
+    return std::max(c.max_pool_mb ? c.max_pool_mb : b.game_max_mb(), c.min_pool_mb);
+}
+
+// `extra` is appended to the line as it is.
+void log_stats(const Targets &t, const char *extra)
 {
     const Live v = read_live(t);
     if (!v.renderer)
@@ -579,9 +609,9 @@ void log_stats(const Targets &t)
     if (v.used_valid)
         std::snprintf(used, sizeof(used), "used %4llu MB", static_cast<unsigned long long>(v.used / kMiB));
 
-    log_line("pool %4llu MB [min %llu, max %llu] | %s | %s | VRAM left for textures %s",
+    log_line("pool %4llu MB [min %llu, max %llu] | %s | %s | VRAM left for textures %s%s",
              static_cast<unsigned long long>(v.pool / kMiB), static_cast<unsigned long long>(v.min_pool / kMiB),
-             static_cast<unsigned long long>(v.max_pool / kMiB), used, streamer, left);
+             static_cast<unsigned long long>(v.max_pool / kMiB), used, streamer, left, extra);
 }
 
 // The "Right now" part of the settings tab.

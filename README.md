@@ -4,7 +4,7 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 
 | Game | Add-on | Download | Played on |
 |---|---|---|---|
-| Control Resonant | `CRStreamingFix.addon64` | [v1.3.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.3.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
+| Control Resonant | `CRStreamingFix.addon64` | [v1.4.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.4.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
 | Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
 | Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
@@ -28,7 +28,7 @@ In one test session (8 GB card, 1440p, path tracing, ray reconstruction and fram
 
 It sets a floor under the pool: 2048 MB by default instead of the game's 100 MB. In the same test session the pool held at 2048 MB and the blur stayed flat at about 2.2 mips.
 
-It can also raise the ceiling and cap the blur. The settings and the live numbers are in a panel in the ReShade menu, and in `CRStreamingFix.ini` and `CRStreamingFix.log`.
+It can also raise the ceiling and cap the blur, and since v1.4.0 it can set the floor by itself from how much VRAM the game has to spare (see [Automatic pool](#automatic-pool-experimental)). The settings and the live numbers are in a panel in the ReShade menu, and in `CRStreamingFix.ini` and `CRStreamingFix.log`.
 
 It finds what it needs by code signature. If the signatures don't match your game version, it logs an error and does nothing. The numbers it shows come from fields that game updates move around, so it reads their positions out of the game's code too, and leaves out any number it cannot place.
 
@@ -65,6 +65,8 @@ The panel and `CRStreamingFix.ini` hold the same settings. The ini is re-read wh
 | `ToggleKey` | None | Key that switches the fix off and on while you play, such as `F8` or `Ctrl+F8`. |
 | `ToggleMessage` | 1 | Show ON or OFF at the top of the screen for a moment when the key is used. Read when the game starts. |
 | `ToggleSound` | 0 | 1 plays two beeps when the key is used: rising for on, falling for off. |
+| `AutoPool` | 0 | 1 lets the add-on set the pool floor by itself, starting from `MinPoolMB`. Experimental. |
+| `AutoOverBudgetMB` | an eighth of the card's memory, 960 on 8 GB | How far over its VRAM budget the game may go with `AutoPool` on. |
 
 ### Switching it off while playing
 
@@ -90,6 +92,8 @@ pool 2048 MB [min 2048, max 3072] | used 1933 MB | demand 1922 MB | bias 2.30 mi
 - **bias** is how many mip levels of blur the streamer is applying. 0 is full resolution.
 - **pool is N MB above it** means the game is using more VRAM than its budget, and Windows pages the difference to system RAM.
 
+Since v1.4.0 the line ends with `game uses 7211 of 6454 MB VRAM budget`, the numbers Windows reports for the game on the graphics card, and with `automatic pool 2560 MB` while the automatic pool is on. The panel shows the same.
+
 In the test session the pool sat about 950 MB above free VRAM with no stutter reported, but that was a short session. If you get stutter, lower `MinPoolMB`, or free VRAM another way: frame generation, path tracing quality, render resolution.
 
 ### Presets by graphics card memory
@@ -99,7 +103,7 @@ Since v1.3.0 the panel has a row of preset buttons, and a first run picks the on
 | Card | Minimum pool | Maximum pool | Where the numbers come from |
 |---|---|---|---|
 | 4 GB | 1536 MB | game's | One user on an RTX 3050 4 GB runs 1664 MB on the Low preset at 1080p with DLSS Performance. Another gets stutter in combat at 2048 MB. |
-| 6 GB | 1792 MB | game's | Not tested yet: halfway between the 4 GB and 8 GB values. |
+| 6 GB | 2048 MB | game's | One user on a 6 GB card runs 2304 MB at 1080p and reports VRAM to spare (about 3.9 of a 5.1 GB budget in use). |
 | 8 GB | 2048 MB | game's | What the add-on was made and played with, path tracing on. |
 | 12 GB | 3072 MB | 6144 MB | Not tested yet: the same share of the card as on 8 GB. |
 | 16 GB and more | 4096 MB | 8192 MB | One user on a 16 GB card runs minimum and maximum at 8192 MB. |
@@ -108,11 +112,30 @@ Treat them as starting points. How much VRAM is left for textures depends on you
 
 A raised maximum is harmless: the game only grows the pool into VRAM that is actually free.
 
+### Automatic pool (experimental)
+
+Since v1.4.0 the panel has an **Automatic pool** box, off by default. With it on, the add-on sets the pool floor by itself instead of holding one fixed value:
+
+- It asks Windows for the game's VRAM budget and usage, the way the game does, and works out the largest pool that keeps the game within the budget plus an allowance.
+- It lowers the floor to that at once, and raises it towards that in steps of 256 MB, only while textures are blurred. It decides every two seconds.
+- **Over budget** (`AutoOverBudgetMB`) is the allowance: how far over its budget the game may go. Windows pages that much to system RAM. Higher is sharper and can stutter. At 0 nothing is paged, and on a small card the result is close to the game without the add-on.
+- It starts from `MinPoolMB`, never goes under 256 MB, and stops at the maximum pool (the game's, or `MaxPoolMB`).
+
+The allowance starts at an eighth of the card's memory, between 256 and 1024 MB. On 8 GB that is 960 MB, about what the fixed 2048 MB floor ran at in the first test session.
+
+What it did in the one session it was played in (about 14 minutes, the 8 GB card under [Tested with](#tested-with)): the floor sat at 2048 MB or more for 84% of the time, with a median of 2304 MB, and the blur had a median of 1.3 mips. It also moved a lot, six to seven times a minute, because the budget Windows gives the game moves by a few hundred MB from one moment to the next. Each move down unloads textures and each move up loads them again. Sound cut out once in that session; whether the automatic pool had a part in that is not known, and one user reported the same with a fixed floor before this mode existed. If it bothers you, untick the box: the fixed floor is still the default.
+
+Switching the fix off with the key or the **Fix on** box stops the automatic pool too. It starts over from `MinPoolMB` when the fix is switched on again.
+
+Not there in the Control (2019) add-on.
+
 Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the pool is also a hard limit on what gets loaded.
 
 ## Tested with
 
-Game 0.564.208.5 with v1.3.0, v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup the author has played it on, panel, on/off key and preset buttons included. On that card the add-on read 7899 MB and matched it to the 8 GB preset; writing a first ini for other card sizes is covered by the offline test only. What users report on other cards is in the preset table above.
+Game 0.564.208.5 with v1.4.0, v1.3.0, v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup the author has played it on, panel, on/off key and preset buttons included. On that card the add-on read 7899 MB and matched it to the 8 GB preset; writing a first ini for other card sizes is covered by the offline test only. What users report on other cards is in the preset table above.
+
+The automatic pool of v1.4.0 was played for about 14 minutes on that card and on no other. The released file differs from the played one in one thing: tooltips are broken into lines, because the longest one ran off the screen.
 
 Game 0.564.478.0 has not been played. Its executable was checked with `build.bat test`: the add-on finds everything it needs there (fit-to-pool `exe+0x2ED93D0`, heap pointer `exe+0x5D0F2E8`, manager pointer `exe+0x5E08C30`), and the fit-to-pool code is the same as in 0.564.208.5.
 

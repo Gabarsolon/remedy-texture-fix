@@ -10,7 +10,7 @@ bool check_card_presets()
     const struct
     {
         uint64_t vram_mb, min_mb, max_mb;
-    } cases[] = {{0, 2048, 0},      {1990, 704, 0},     {3962, 1536, 0},     {4096, 1536, 0},      {5980, 1792, 0},
+    } cases[] = {{0, 2048, 0},      {1990, 704, 0},     {3962, 1536, 0},     {4096, 1536, 0},      {5980, 2048, 0},
                  {7949, 2048, 0},   {8192, 2048, 0},    {10018, 2048, 0},    {12282, 3072, 6144},  {16311, 4096, 8192},
                  {24564, 4096, 8192}};
     bool ok = true;
@@ -33,10 +33,13 @@ bool check_card_presets()
     DeleteFileW(ini_path().c_str());
     g_default_min_mb = 3072;
     g_default_max_mb = kHasMaxPool ? 6144 : 0;
+    g_default_over_mb = 1024;
     write_default_ini();
+    g_default_over_mb = 960; // so the value read back is the one in the file
     const Config written = read_config();
     const bool ini_ok = written.min_pool_mb == 3072 && written.max_pool_mb == g_default_max_mb &&
-                        written.bias_limit == -1.0f && written.toggle_key == 0 && written.toggle_message && !written.toggle_sound;
+                        written.bias_limit == -1.0f && written.toggle_key == 0 && written.toggle_message &&
+                        !written.toggle_sound && !written.auto_pool && written.auto_over_mb == (kHasAuto ? 1024 : 960);
     std::printf("%s a first ini on a 12 GB card starts at %llu MB, the other settings at their defaults\n",
                 ini_ok ? "OK  " : "FAIL", written.min_pool_mb);
     DeleteFileW(ini_path().c_str());
@@ -55,7 +58,99 @@ bool check_card_presets()
         std::printf("%s this machine's card: %llu MB, a new ini would start at %llu MB\n", g_create_factory ? "OK  " : "FAIL",
                     vram, defaults_for_vram(vram).min_mb);
         ok = ok && g_create_factory;
+        if constexpr (kHasAuto)
+        {
+            const VideoMemory memory = read_video_memory();
+            std::printf("%s this machine's card: Windows gives this process a VRAM budget of %llu MB, it uses %llu MB\n",
+                        memory.valid || !vram ? "OK  " : "FAIL", memory.budget / kMiB, memory.usage / kMiB);
+            ok = ok && (memory.valid || !vram);
+        }
     }
+    return ok;
+}
+
+// Tooltips are broken into lines by the add-on, because ImGui draws them as one.
+bool check_tooltip_wrap()
+{
+    const std::string wrapped = wrap_text("The add-on sets the minimum pool by itself. It raises it while textures are "
+                                          "blurred and the game's VRAM budget has room.", 40);
+    const bool ok = wrapped == "The add-on sets the minimum pool by\nitself. It raises it while textures are\n"
+                               "blurred and the game's VRAM budget has\nroom." &&
+                    wrap_text("short", 72) == "short" && wrap_text("", 72).empty() &&
+                    wrap_text("a-word-longer-than-the-line next", 10) == "a-word-longer-than-the-line\nnext";
+    std::printf("%s tooltips are broken into lines that fit\n", ok ? "OK  " : "FAIL");
+    return ok;
+}
+
+// Automatic mode on made-up readings. Nothing here asks the graphics card.
+bool check_automatic()
+{
+    if constexpr (!kHasAuto)
+        return true;
+    bool ok = true;
+    const auto expect = [&ok](const char *what, uint64_t got, uint64_t want) {
+        if (got != want)
+        {
+            std::printf("FAIL automatic pool %s: %llu MB, expected %llu\n", what, got, want);
+            ok = false;
+        }
+    };
+
+    // An 8 GB card: budget 7100 MB, the game holds 6000 MB besides textures, 960 MB over is allowed.
+    // 2060 MB fit, which is 2048 in steps of 64.
+    expect("comes down at once to what fits", auto_pool_mb({3072, 7100, 6000, 960, 4096, true}), 2048);
+    expect("goes up a step at a time while textures are blurred", auto_pool_mb({1024, 7100, 6000, 960, 4096, true}), 1280);
+    expect("stops at what fits", auto_pool_mb({1920, 7100, 6000, 960, 4096, true}), 2048);
+    expect("stays put while textures are sharp", auto_pool_mb({1024, 7100, 6000, 960, 4096, false}), 1024);
+    expect("leaves a small difference alone", auto_pool_mb({2112, 7100, 6000, 960, 4096, true}), 2112);
+    expect("with nothing allowed over, follows the game's own rule", auto_pool_mb({2048, 7100, 6000, 0, 4096, true}), 1088);
+    expect("never goes under 256 MB", auto_pool_mb({2048, 7100, 9000, 0, 4096, true}), 256);
+    expect("never goes over the maximum pool", auto_pool_mb({1408, 16000, 3000, 1024, 1664, true}), 1664);
+    expect("comes down to a lowered maximum pool", auto_pool_mb({4096, 16000, 3000, 1024, 3072, false}), 3072);
+    // The 6 GB card of a user report: budget 5202 MB, 4393 MB used with about 1700 MB of textures.
+    expect("on a 6 GB card with room", auto_pool_mb({2048, 5202, 2693, 704, 4096, true}), 2304);
+
+    const struct
+    {
+        uint64_t vram_mb, over_mb;
+    } cards[] = {{0, 960}, {1990, 256}, {3962, 448}, {5980, 704}, {7899, 960}, {12282, 1024}, {24564, 1024}};
+    for (const auto &c : cards)
+        expect("allowance for a card", over_budget_for_vram(c.vram_mb), c.over_mb);
+
+    // Tick by tick: 6500 MB besides textures leave 1560 MB, so 1536.
+    AutoState a;
+    Config c;
+    c.auto_pool = true;
+    c.min_pool_mb = 2048;
+    c.auto_over_mb = 960;
+    const VideoMemory memory = {true, 7100 * kMiB, 8400 * kMiB};
+    const AutoSample game = {true, 1900 * kMiB, true};
+    uint64_t pool = 0;
+    ULONGLONG now = 1000;
+    for (; now < 1000 + kAutoWindowMs; now += 250)
+        pool = auto_tick(a, c, 4096, memory, game, now);
+    expect("starts from MinPoolMB", pool, 2048);
+    pool = auto_tick(a, c, 4096, memory, game, now);
+    expect("decides when the window is over", pool, 1536);
+    ok = ok && a.decided;
+
+    const VideoMemory other_card = {true, 7100 * kMiB, 100 * kMiB}; // less in use than the pool alone holds
+    for (int i = 0; i < 9; ++i)
+        pool = auto_tick(a, c, 4096, other_card, game, now += 250);
+    expect("keeps its value when the readings cannot be the game's", pool, 1536);
+    ok = ok && !a.decided;
+    for (int i = 0; i < 9; ++i)
+        pool = auto_tick(a, c, 0, memory, game, now += 250);
+    expect("keeps its value while the game's maximum pool is not known", pool, 1536);
+    ok = ok && !a.decided;
+
+    c.min_pool_mb = 1024;
+    expect("starts over when MinPoolMB changes", auto_tick(a, c, 4096, memory, game, now += 250), 1024);
+    for (int i = 0; i < 8 * 4; ++i)
+        pool = auto_tick(a, c, 4096, memory, game, now += 250);
+    expect("climbs back to what fits", pool, 1536);
+
+    std::printf("%s automatic pool on made-up readings\n", ok ? "OK  " : "FAIL");
     return ok;
 }
 } // namespace
@@ -135,6 +230,8 @@ int wmain(int argc, wchar_t **argv)
         ok = ok && present;
     }
     ok = check_card_presets() && ok;
+    ok = check_automatic() && ok;
+    ok = check_tooltip_wrap() && ok;
     return ok ? 0 : 1;
 }
 
@@ -207,6 +304,8 @@ int wmain(int argc, wchar_t **argv)
     if (!known)
         std::printf("note: not a build with known addresses, nothing to compare against\n");
     ok = check_card_presets() && ok;
+    ok = check_automatic() && ok;
+    ok = check_tooltip_wrap() && ok;
     return ok ? 0 : 1;
 }
 

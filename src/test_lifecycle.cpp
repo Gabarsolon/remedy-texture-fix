@@ -437,7 +437,44 @@ int wmain()
     test_toggle_key([] { return g_heap_obj[1] == 2048 * MiB && g_bias_limit == 2.0f; },
                     [] { return g_heap_obj[1] == 100 * MiB && g_bias_limit == 10.0f; });
 
-    std::printf("14. Exit with the add-on loaded\n");
+    // This process has nothing on a graphics card, so automatic mode never gets a reading it can use here.
+    // What it does with readings is checked in test_locate, on made-up ones.
+    std::printf("14. Automatic pool\n");
+    replace_ini("[" CRSF_NAME "]\r\nMinPoolMB=2048\r\nBiasLimit=2\r\nLogIntervalSec=1\r\n");
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    frames();
+    check(!drew("Automatic pool:") && g_shown.count("Over budget") == 0, "off unless asked for, its settings not shown");
+    g_script.toggle = "Automatic pool";
+    frames();
+    Sleep(450);
+    check(ini_int(L"AutoPool") == 1 && drew("Automatic pool: no readings yet") && g_shown["Over budget"] == 960,
+          "ticking it saves it and shows the allowance; without readings the tab says so");
+    g_script.edit = "Over budget";
+    g_script.value = 500;
+    g_script.release = "Over budget";
+    frames();
+    Sleep(450);
+    check(ini_int(L"AutoOverBudgetMB") == 512, "the allowance is saved, in steps of 64 MB");
+    Sleep(2600);
+    check(log_contains("AutoPool=1 AutoOverBudgetMB=512") && log_contains("automatic pool waits for readings"), "logged");
+    check(g_heap_obj[1] == 2048 * MiB, "without readings the minimum pool from the ini stays in force");
+    g_script.toggle = "Fix on";
+    frames();
+    Sleep(450);
+    frames();
+    check(g_heap_obj[1] == 100 * MiB && drew("Automatic pool: waits while the fix is off"), "off is still off");
+    g_script.toggle = "Fix on";
+    frames();
+    g_script.click = "Defaults";
+    frames();
+    Sleep(450);
+    check(ini_int(L"AutoPool") == 0 && ini_int(L"AutoOverBudgetMB") == 960 && g_heap_obj[1] == 2048 * MiB,
+          "Defaults switches it off again");
+    FreeLibrary(m);
+    check(!loaded(), "unloads cleanly");
+
+    std::printf("15. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

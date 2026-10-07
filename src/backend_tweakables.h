@@ -26,6 +26,8 @@ constexpr bool kHasMaxPool = false; // the ceiling is the game's Texture Resolut
     "; Above the pool your Texture Resolution setting asks for (512 to 4096), it raises the pool.\r\n"    \
     "; 0 = leave the game's value.\r\n"
 #define CRSF_INI_MAX_POOL_BLOCK ""
+constexpr bool kHasAuto = false; // automatic mode is not there for this game
+#define CRSF_INI_AUTO_BLOCK ""
 
 // d::BaseTweakable, as the game's own getters and setters use it.
 constexpr uintptr_t kTweakType = 0xA8;    // 0 bool, 1 int, 2 float
@@ -333,7 +335,17 @@ Live read_live(const Targets &t)
     return v;
 }
 
-void log_stats(const Targets &t)
+AutoSample auto_sample(const Live &)
+{
+    return {};
+}
+
+uint64_t auto_ceiling_mb(const Config &, const Baseline &)
+{
+    return 0;
+}
+
+void log_stats(const Targets &t, const char * /*extra*/)
 {
     const Live v = read_live(t);
     if (!v.renderer)

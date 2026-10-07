@@ -14,7 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <mmsystem.h>
 #include <psapi.h>
 #include <algorithm>
@@ -53,6 +53,10 @@ constexpr DWORD kKeyTickMs = 30; // how often the on/off key is looked at
 constexpr DWORD kMessageMs = 2500; // how long "ON" / "OFF" stays on screen
 constexpr char kOverlayTitle[] = CRSF_NAME;
 constexpr char kOsdTitle[] = "OSD"; // ReShade draws overlays of this name every frame, menu open or not
+constexpr DWORD kAutoWindowMs = 2000;  // automatic mode decides once per window, on the average over it
+constexpr uint64_t kAutoFloorMb = 256; // it never goes below this
+constexpr uint64_t kAutoStepMb = 256;  // largest raise per decision
+constexpr uint64_t kAutoSlackMb = 128; // it leaves the pool alone while it is this close to where it would put it
 
 HMODULE g_module = nullptr;
 uintptr_t g_exe_base = 0;
@@ -79,6 +83,7 @@ create_factory_fn g_create_factory = nullptr; // dxgi's CreateDXGIFactory1, if t
 // Set in the first tick, before g_located: the graphics card and what the add-on starts from on it.
 uint64_t g_vram_mb = 0; // 0 = not known
 uint64_t g_default_min_mb = 2048, g_default_max_mb = 0;
+uint64_t g_default_over_mb = 960; // AutoOverBudgetMB
 volatile LONG g_located = 0;       // the backend found the game's pool, g_state.targets is final
 volatile LONG g_locate_failed = 0; // unsupported game version
 bool g_registered_with_reshade = false;
@@ -95,6 +100,36 @@ struct Config
     uint32_t toggle_key = 0;   // virtual-key code plus kKeyCtrl / kKeyShift / kKeyAlt; 0 = no key
     bool toggle_sound = false; // two beeps when the key switches the fix
     bool toggle_message = true; // "ON" / "OFF" on screen when the key switches the fix
+    bool auto_pool = false;     // the add-on picks the minimum pool itself, starting from min_pool_mb
+    uint64_t auto_over_mb = 960; // how far over its VRAM budget the game may go in automatic mode
+};
+
+// The graphics card's memory as Windows accounts it for this process.
+struct VideoMemory
+{
+    bool valid = false;
+    uint64_t budget = 0; // what Windows lets the game use right now
+    uint64_t usage = 0;  // what the game uses
+};
+
+// What automatic mode needs to know about the texture pool, filled in by the backend.
+struct AutoSample
+{
+    bool valid = false;
+    uint64_t held = 0;     // VRAM the pool holds right now, in bytes
+    bool starving = false; // textures are being blurred to fit the pool
+};
+
+// Automatic mode between two ticks. Tick thread only.
+struct AutoState
+{
+    uint64_t start_mb = 0; // the minimum pool it started from; 0 = not running
+    uint64_t pool_mb = 0;  // the minimum pool it has settled on
+    bool decided = false;  // the last window had readings to decide on
+    ULONGLONG since = 0;   // start of the current window
+    uint64_t other_sum_mb = 0, budget_mb = 0;
+    uint32_t samples = 0;
+    bool starving = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -188,9 +223,39 @@ HMODULE find_module_exporting(const char *name, const char *also = nullptr)
     return nullptr;
 }
 
+// Breaks text into lines of at most `width` characters, at spaces.
+std::string wrap_text(const char *text, size_t width)
+{
+    std::string out;
+    size_t line = 0;
+    for (const char *p = text; *p;)
+    {
+        const char *end = p;
+        while (*end && *end != ' ')
+            ++end;
+        const size_t word = static_cast<size_t>(end - p);
+        if (line && line + 1 + word > width)
+        {
+            out += '\n';
+            line = 0;
+        }
+        else if (line)
+        {
+            out += ' ';
+            ++line;
+        }
+        out.append(p, word);
+        line += word;
+        for (p = end; *p == ' ';)
+            ++p;
+    }
+    return out;
+}
+
+// ImGui draws a tooltip as one line however long it is, and a long one runs off the screen.
 void tooltip(const char *text)
 {
-    ImGui::SetItemTooltip("%s", text);
+    ImGui::SetItemTooltip("%s", wrap_text(text, 72).c_str());
 }
 
 // Each backend provides: kHasMaxPool, the CRSF_INI_* texts, Targets, Baseline, Live, on_attach(), locate(),
@@ -207,6 +272,10 @@ struct State
     bool announce = true;      // log the limits at the next apply
     bool save_pending = false; // cfg was changed in the ReShade menu and must be written to the ini
     bool paused = false;       // g_paused as last applied; tick thread only
+    AutoState automatic;       // tick thread only
+    VideoMemory memory;        // as of the last tick, for the tab
+    uint64_t auto_mb = 0;      // minimum pool automatic mode has in force; 0 = it is off
+    bool auto_decided = false; // it has readings to go by
     Targets targets;
     Config cfg;
     FILETIME cfg_time = {}; // tick thread only
@@ -475,7 +544,7 @@ struct Preset
 // Only the 8 GB row was played by the author. The others rest on what users reported, or on nothing yet.
 constexpr Preset kPresets[] = {
     {"4 GB", 5, 1536, 0, "One user runs 1664 MB on low settings; another gets stutter in combat at 2048."},
-    {"6 GB", 7, 1792, 0, "Not tested yet: halfway between the 4 GB and 8 GB values."},
+    {"6 GB", 7, 2048, 0, "One user with 6 GB runs 2304 MB at 1080p with VRAM to spare."},
     {"8 GB", 10, 2048, 0, "What the add-on was made and tested with, path tracing on."},
     {"12 GB", 14, 3072, 6144, "Not tested yet: the same share of the card as on 8 GB."},
     {"16 GB+", 0xFFFFFFFF, 4096, 8192, "One user with 16 GB runs minimum and maximum at 8192 MB."},
@@ -500,6 +569,30 @@ PoolDefaults defaults_for_vram(uint64_t vram_mb)
     return {2048, 0};
 }
 
+// How far over the budget automatic mode may go on a card with this much memory: an eighth of it, which
+// on 8 GB is what the fixed 2048 MB ran at when the add-on was first played. 0 (not known) gives that.
+uint64_t over_budget_for_vram(uint64_t vram_mb)
+{
+    return vram_mb ? std::clamp<uint64_t>(vram_mb / 8 / 64 * 64, 256, 1024) : 960;
+}
+
+// The card detect_vram_mb() picked. Asked at every tick, so it is kept; it is never released, because
+// DllMain is no place for that and the add-on normally stays until the game exits.
+IDXGIAdapter3 *g_adapter = nullptr;
+
+VideoMemory read_video_memory()
+{
+    VideoMemory m;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (g_adapter && SUCCEEDED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) && info.Budget)
+    {
+        m.valid = true;
+        m.budget = info.Budget;
+        m.usage = info.CurrentUsage;
+    }
+    return m;
+}
+
 // Dedicated memory of the largest graphics card in MB, 0 if it cannot be asked. On a laptop that is the
 // discrete card, which is the one the game runs on.
 uint64_t detect_vram_mb()
@@ -514,12 +607,84 @@ uint64_t detect_vram_mb()
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; ++i)
     {
         DXGI_ADAPTER_DESC1 desc = {};
-        if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
-            best = std::max<uint64_t>(best, desc.DedicatedVideoMemory / kMiB);
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            desc.DedicatedVideoMemory / kMiB > best)
+        {
+            best = desc.DedicatedVideoMemory / kMiB;
+            if constexpr (kHasAuto)
+            {
+                if (g_adapter)
+                    g_adapter->Release();
+                g_adapter = nullptr;
+                adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&g_adapter));
+            }
+        }
         adapter->Release();
     }
     factory->Release();
     return best;
+}
+
+// ---------------------------------------------------------------------------------------
+// automatic mode
+
+struct AutoInput
+{
+    uint64_t pool_mb;    // minimum pool in force
+    uint64_t budget_mb;  // what Windows lets the game use on the card
+    uint64_t other_mb;   // what the game has in VRAM besides the texture pool
+    uint64_t over_mb;    // how far over the budget it may go
+    uint64_t ceiling_mb; // maximum pool
+    bool starving;       // textures are being blurred to fit the pool
+};
+
+// The game sizes its pool as budget minus everything else. Automatic mode does the same with the allowance
+// added: "room" is the largest pool that keeps the game within budget + allowance if the pool fills up.
+// It comes down to that at once, and goes up towards it in steps, only while textures are blurred.
+uint64_t auto_pool_mb(const AutoInput &in)
+{
+    const uint64_t ceiling = std::max(in.ceiling_mb, kAutoFloorMb);
+    const uint64_t limit = in.budget_mb + in.over_mb;
+    const uint64_t room = std::clamp(limit > in.other_mb ? (limit - in.other_mb) / 64 * 64 : 0, kAutoFloorMb, ceiling);
+    const uint64_t pool = std::clamp(in.pool_mb, kAutoFloorMb, ceiling);
+    if (pool > room + kAutoSlackMb)
+        return room;
+    if (in.starving && pool + kAutoSlackMb <= room)
+        return std::min(pool + kAutoStepMb, room);
+    return pool;
+}
+
+// One tick of automatic mode: takes a reading, and at the end of each window decides. Returns the minimum
+// pool to apply. `ceiling_mb` is 0 while the game's own maximum is not known yet.
+uint64_t auto_tick(AutoState &a, const Config &c, uint64_t ceiling_mb, const VideoMemory &m, const AutoSample &g,
+                   ULONGLONG now)
+{
+    const uint64_t start = c.min_pool_mb ? c.min_pool_mb : g_default_min_mb;
+    if (a.start_mb != start)
+    {
+        a = AutoState();
+        a.start_mb = a.pool_mb = start;
+        a.since = now;
+    }
+    // A process that uses less VRAM than its texture pool holds is not what was asked about: the game
+    // runs on another card than the one the add-on picked.
+    if (ceiling_mb && m.valid && g.valid && m.usage >= g.held)
+    {
+        a.other_sum_mb += (m.usage - g.held) / kMiB;
+        a.budget_mb = m.budget / kMiB;
+        a.starving = g.starving;
+        ++a.samples;
+    }
+    if (now - a.since < kAutoWindowMs)
+        return a.pool_mb;
+
+    a.decided = a.samples != 0;
+    if (a.decided)
+        a.pool_mb = auto_pool_mb({a.pool_mb, a.budget_mb, a.other_sum_mb / a.samples, c.auto_over_mb, ceiling_mb, a.starving});
+    a.since = now;
+    a.other_sum_mb = 0;
+    a.samples = 0;
+    return a.pool_mb;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -541,9 +706,10 @@ void write_default_ini()
         "[" CRSF_NAME "]\r\n"
         CRSF_INI_MIN_POOL
         "; When this file is first written, the value is picked for the memory of your graphics card:\r\n"
-        "; 1536 for 4 GB, 1792 for 6 GB, 2048 for 8 GB, 3072 for 12 GB, 4096 for 16 GB and more.\r\n"
+        "; 1536 for 4 GB, 2048 for 6 and 8 GB, 3072 for 12 GB, 4096 for 16 GB and more.\r\n"
         "MinPoolMB=2048\r\n"
         CRSF_INI_MAX_POOL_BLOCK
+        CRSF_INI_AUTO_BLOCK
         "; Largest mip bias the streamer may add when textures don't fit the pool (game default 10).\r\n"
         "; -1 = leave the game's value.\r\n"
         "BiasLimit=-1\r\n"
@@ -576,6 +742,14 @@ void write_default_ini()
         std::swprintf(buf, 32, L"%llu", static_cast<unsigned long long>(g_default_max_mb));
         WritePrivateProfileStringW(CRSF_NAME_W, L"MaxPoolMB", buf, path.c_str());
     }
+    if constexpr (kHasAuto)
+    {
+        if (g_default_over_mb != 960)
+        {
+            std::swprintf(buf, 32, L"%llu", static_cast<unsigned long long>(g_default_over_mb));
+            WritePrivateProfileStringW(CRSF_NAME_W, L"AutoOverBudgetMB", buf, path.c_str());
+        }
+    }
 }
 
 Config read_config()
@@ -593,6 +767,15 @@ Config read_config()
     c.toggle_key = parse_key(buf);
     c.toggle_sound = GetPrivateProfileIntW(CRSF_NAME_W, L"ToggleSound", 0, path.c_str()) != 0;
     c.toggle_message = GetPrivateProfileIntW(CRSF_NAME_W, L"ToggleMessage", 1, path.c_str()) != 0;
+    c.auto_over_mb = g_default_over_mb;
+    if constexpr (kHasAuto)
+    {
+        c.auto_pool = GetPrivateProfileIntW(CRSF_NAME_W, L"AutoPool", 0, path.c_str()) != 0;
+        c.auto_over_mb =
+            GetPrivateProfileIntW(CRSF_NAME_W, L"AutoOverBudgetMB", static_cast<INT>(g_default_over_mb), path.c_str());
+    }
+    if (c.auto_over_mb > 16384)
+        c.auto_over_mb = 16384;
     if (c.min_pool_mb > 16384)
         c.min_pool_mb = 16384;
     if (c.max_pool_mb > 16384)
@@ -627,6 +810,12 @@ void write_config(const Config &c)
     WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleKey", buf, path.c_str());
     WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleSound", c.toggle_sound ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(CRSF_NAME_W, L"ToggleMessage", c.toggle_message ? L"1" : L"0", path.c_str());
+    if constexpr (kHasAuto)
+    {
+        WritePrivateProfileStringW(CRSF_NAME_W, L"AutoPool", c.auto_pool ? L"1" : L"0", path.c_str());
+        std::swprintf(buf, 32, L"%llu", static_cast<unsigned long long>(c.auto_over_mb));
+        WritePrivateProfileStringW(CRSF_NAME_W, L"AutoOverBudgetMB", buf, path.c_str());
+    }
 }
 
 FILETIME ini_time()
@@ -641,10 +830,14 @@ void log_config(const char *what, const Config &c)
     char max_pool[40] = "";
     if constexpr (kHasMaxPool)
         std::snprintf(max_pool, sizeof(max_pool), " MaxPoolMB=%llu", static_cast<unsigned long long>(c.max_pool_mb));
+    char automatic[64] = "";
+    if constexpr (kHasAuto)
+        std::snprintf(automatic, sizeof(automatic), " AutoPool=%d AutoOverBudgetMB=%llu", c.auto_pool ? 1 : 0,
+                      static_cast<unsigned long long>(c.auto_over_mb));
     char key[32];
     key_text(c.toggle_key, key, sizeof(key));
-    log_line("%s: MinPoolMB=%llu%s BiasLimit=%.2f LogIntervalSec=%u ToggleKey=%s", what,
-             static_cast<unsigned long long>(c.min_pool_mb), max_pool, c.bias_limit, c.log_interval_s, key);
+    log_line("%s: MinPoolMB=%llu%s%s BiasLimit=%.2f LogIntervalSec=%u ToggleKey=%s", what,
+             static_cast<unsigned long long>(c.min_pool_mb), max_pool, automatic, c.bias_limit, c.log_interval_s, key);
 }
 
 // What "off" applies: every value left to the game.
@@ -682,6 +875,7 @@ VOID CALLBACK tick(PVOID, BOOLEAN)
             g_default_min_mb = defaults.min_mb;
             if constexpr (kHasMaxPool)
                 g_default_max_mb = defaults.max_mb;
+            g_default_over_mb = over_budget_for_vram(g_vram_mb);
             if (g_vram_mb)
                 log_line("Graphics card: %llu MB of memory. A new ini starts with a minimum pool of %llu MB for it.",
                          static_cast<unsigned long long>(g_vram_mb), static_cast<unsigned long long>(g_default_min_mb));
@@ -729,7 +923,28 @@ VOID CALLBACK tick(PVOID, BOOLEAN)
                             : "Switched on.");
         }
         const Config cfg = s.cfg;
-        apply(s.targets, paused ? game_values(cfg) : cfg, s.base, s.announce);
+        Config in_force = cfg;
+        if constexpr (kHasAuto)
+        {
+            s.memory = read_video_memory();
+            if (cfg.auto_pool && !paused)
+            {
+                in_force.min_pool_mb = s.auto_mb =
+                    auto_tick(s.automatic, cfg, auto_ceiling_mb(cfg, s.base), s.memory, auto_sample(read_live(s.targets)),
+                              GetTickCount64());
+                s.auto_decided = s.automatic.decided;
+            }
+            else
+            {
+                s.automatic = AutoState(); // it starts over from MinPoolMB when it is switched on again
+                s.auto_mb = 0;
+                s.auto_decided = false;
+            }
+        }
+        const VideoMemory memory = s.memory;
+        const uint64_t auto_mb = s.auto_mb;
+        const bool auto_decided = s.auto_decided;
+        apply(s.targets, paused ? game_values(cfg) : in_force, s.base, s.announce);
         ReleaseSRWLockExclusive(&g_lock);
         InterlockedExchange(&g_toggle_key, static_cast<LONG>(cfg.toggle_key));
         InterlockedExchange(&g_toggle_sound, cfg.toggle_sound ? 1 : 0);
@@ -751,7 +966,23 @@ VOID CALLBACK tick(PVOID, BOOLEAN)
         if (cfg.log_interval_s && now - s.last_stats >= cfg.log_interval_s * 1000ull)
         {
             s.last_stats = now;
-            log_stats(s.targets);
+            char extra[160] = "";
+            if constexpr (kHasAuto)
+            {
+                int n = 0;
+                if (!memory.valid)
+                    n = std::snprintf(extra, sizeof(extra), " | game uses n/a of its VRAM budget");
+                else
+                    n = std::snprintf(extra, sizeof(extra), " | game uses %llu of %llu MB VRAM budget",
+                                      static_cast<unsigned long long>(memory.usage / kMiB),
+                                      static_cast<unsigned long long>(memory.budget / kMiB));
+                if (auto_mb && auto_decided)
+                    std::snprintf(extra + n, sizeof(extra) - n, " | automatic pool %llu MB",
+                                  static_cast<unsigned long long>(auto_mb));
+                else if (auto_mb)
+                    std::snprintf(extra + n, sizeof(extra) - n, " | automatic pool waits for readings");
+            }
+            log_stats(s.targets, extra);
         }
     }
 
@@ -788,6 +1019,9 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
     static Config ui_cfg;
     static Baseline ui_base;
     static bool ui_synced = false, ui_dirty = false, ui_save = false;
+    static VideoMemory ui_memory;
+    static uint64_t ui_auto_mb = 0;
+    static bool ui_auto_decided = false;
     if (TryAcquireSRWLockExclusive(&g_lock))
     {
         if (ui_dirty)
@@ -806,6 +1040,9 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
             ui_save = false;
         }
         ui_base = s.base;
+        ui_memory = s.memory;
+        ui_auto_mb = s.auto_mb;
+        ui_auto_decided = s.auto_decided;
         ui_synced = true;
         ReleaseSRWLockExclusive(&g_lock);
     }
@@ -825,10 +1062,31 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
         ImGui::PopStyleColor();
     }
     draw_status(read_live(s.targets));
+    char text[192];
+    if constexpr (kHasAuto)
+    {
+        if (ui_memory.valid)
+        {
+            const bool over = ui_memory.usage > ui_memory.budget;
+            const int n = std::snprintf(text, sizeof(text), "The game uses %llu of its %llu MB VRAM budget",
+                                        static_cast<unsigned long long>(ui_memory.usage / kMiB),
+                                        static_cast<unsigned long long>(ui_memory.budget / kMiB));
+            if (over)
+            {
+                std::snprintf(text + n, sizeof(text) - n, " (%llu MB over)",
+                              static_cast<unsigned long long>((ui_memory.usage - ui_memory.budget) / kMiB));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.25f, 1.0f));
+            }
+            ImGui::TextUnformatted(text);
+            if (over)
+                ImGui::PopStyleColor();
+            tooltip("What the game has on the graphics card, and what Windows lets it have there right now. "
+                    "What is over the budget, Windows pages to system RAM.");
+        }
+    }
 
     ImGui::SeparatorText("Settings");
     bool changed = false, released = false;
-    char text[192];
     char format[64];
 
     bool fix_on = !paused;
@@ -849,8 +1107,9 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
         changed = true;
     }
     released |= ImGui::IsItemDeactivatedAfterEdit();
-    tooltip("Smallest texture pool. Higher is sharper. Above your free VRAM, Windows pages textures to system RAM, "
-            "which can stutter. 0 leaves the game's value.");
+    tooltip(ui_cfg.auto_pool ? "Where the automatic pool starts when the game does, before it has readings to go by."
+                             : "Smallest texture pool. Higher is sharper. Above your free VRAM, Windows pages textures to "
+                               "system RAM, which can stutter. 0 leaves the game's value.");
 
     if constexpr (kHasMaxPool)
     {
@@ -868,6 +1127,36 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
         released |= ImGui::IsItemDeactivatedAfterEdit();
         tooltip("Largest texture pool. 0 leaves the game's value, which follows Texture Resolution. "
                 "It is raised to the minimum if the minimum is higher.");
+    }
+
+    if constexpr (kHasAuto)
+    {
+        if (ImGui::Checkbox("Automatic pool", &ui_cfg.auto_pool))
+            changed = released = true;
+        tooltip("The add-on sets the minimum pool by itself. It raises it while textures are blurred and the game's "
+                "VRAM budget has room, and lowers it when the game goes further over the budget than you allow below. "
+                "Experimental: played on one 8 GB card only.");
+        if (ui_cfg.auto_pool)
+        {
+            if (paused)
+                std::snprintf(text, sizeof(text), "Automatic pool: waits while the fix is off.");
+            else if (ui_auto_mb && ui_auto_decided)
+                std::snprintf(text, sizeof(text), "Automatic pool: minimum is %llu MB now.",
+                              static_cast<unsigned long long>(ui_auto_mb));
+            else
+                std::snprintf(text, sizeof(text), "Automatic pool: no readings yet, the minimum pool above is used.");
+            ImGui::TextUnformatted(text);
+            int over_mb = static_cast<int>(ui_cfg.auto_over_mb);
+            if (ImGui::SliderInt("Over budget", &over_mb, 0, 4096, "%d MB"))
+            {
+                ui_cfg.auto_over_mb = static_cast<uint64_t>(std::clamp((over_mb + 32) / 64 * 64, 0, 16384));
+                changed = true;
+            }
+            released |= ImGui::IsItemDeactivatedAfterEdit();
+            tooltip("How far over its VRAM budget the game may go. Windows pages that much to system RAM. "
+                    "Higher is sharper and can stutter. At 0 nothing is paged, and on a small card the result is "
+                    "close to the game without the add-on.");
+        }
     }
 
     if (g_vram_mb)
@@ -982,6 +1271,7 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
         ui_cfg = Config();
         ui_cfg.min_pool_mb = g_default_min_mb;
         ui_cfg.max_pool_mb = g_default_max_mb;
+        ui_cfg.auto_over_mb = g_default_over_mb;
         ui_cfg.toggle_key = old.toggle_key; // the key is not one of the values the button is about
         ui_cfg.toggle_sound = old.toggle_sound;
         ui_cfg.toggle_message = old.toggle_message;
