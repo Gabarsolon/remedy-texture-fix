@@ -29,8 +29,8 @@ constexpr bool kHasAuto = true;
     "MaxPoolMB=0\r\n"
 #define CRSF_INI_AUTO_BLOCK                                                                                     \
     "; 1 = the add-on sets the minimum pool by itself, starting from MinPoolMB. It raises it while\r\n"        \
-    "; textures are blurred and the game's VRAM budget has room, and lowers it when the game goes further\r\n" \
-    "; over the budget than AutoOverBudgetMB. 0 = MinPoolMB is used as it is.\r\n"                             \
+    "; textures are blurred and the game's VRAM budget has room, and lowers it when the game is further\r\n"   \
+    "; over the budget than AutoOverBudgetMB for some seconds. 0 = MinPoolMB is used as it is.\r\n"            \
     "AutoPool=0\r\n"                                                                                           \
     "; How far over its VRAM budget the game may go in automatic mode, in MB. Windows pages that much to\r\n"  \
     "; system RAM. Higher = sharper, and it can stutter. When this file is first written, the value is\r\n"    \

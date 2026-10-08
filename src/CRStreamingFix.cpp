@@ -55,8 +55,9 @@ constexpr char kOverlayTitle[] = CRSF_NAME;
 constexpr char kOsdTitle[] = "OSD"; // ReShade draws overlays of this name every frame, menu open or not
 constexpr DWORD kAutoWindowMs = 2000;  // automatic mode decides once per window, on the average over it
 constexpr uint64_t kAutoFloorMb = 256; // it never goes below this
-constexpr uint64_t kAutoStepMb = 256;  // largest raise per decision
-constexpr uint64_t kAutoSlackMb = 128; // it leaves the pool alone while it is this close to where it would put it
+constexpr uint64_t kAutoStepMb = 256;  // it raises the pool by this much per decision, and only if all of it fits
+constexpr uint64_t kAutoSlackMb = 256; // it leaves the pool alone while it is no more than this over what fits
+constexpr uint32_t kAutoLowerWindows = 4; // it lowers the pool only after this many windows in a row over that
 
 HMODULE g_module = nullptr;
 uintptr_t g_exe_base = 0;
@@ -120,6 +121,13 @@ struct AutoSample
     bool starving = false; // textures are being blurred to fit the pool
 };
 
+// Windows in a row in which the pool was over what fits, and the most that fitted in any of them.
+struct AutoExcess
+{
+    uint32_t windows = 0;
+    uint64_t room_mb = 0;
+};
+
 // Automatic mode between two ticks. Tick thread only.
 struct AutoState
 {
@@ -130,6 +138,7 @@ struct AutoState
     uint64_t other_sum_mb = 0, budget_mb = 0;
     uint32_t samples = 0;
     bool starving = false;
+    AutoExcess excess;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -640,17 +649,27 @@ struct AutoInput
 
 // The game sizes its pool as budget minus everything else. Automatic mode does the same with the allowance
 // added: "room" is the largest pool that keeps the game within budget + allowance if the pool fills up.
-// It comes down to that at once, and goes up towards it in steps, only while textures are blurred.
-uint64_t auto_pool_mb(const AutoInput &in)
+// It goes up towards that in steps, only while textures are blurred. It comes down only when the pool has
+// been over it for several windows in a row, and then to the most that fitted in any of them: the budget
+// dips for a few seconds all the time, and every change of the pool unloads or reloads textures.
+uint64_t auto_pool_mb(const AutoInput &in, AutoExcess &excess)
 {
     const uint64_t ceiling = std::max(in.ceiling_mb, kAutoFloorMb);
     const uint64_t limit = in.budget_mb + in.over_mb;
     const uint64_t room = std::clamp(limit > in.other_mb ? (limit - in.other_mb) / 64 * 64 : 0, kAutoFloorMb, ceiling);
     const uint64_t pool = std::clamp(in.pool_mb, kAutoFloorMb, ceiling);
     if (pool > room + kAutoSlackMb)
-        return room;
-    if (in.starving && pool + kAutoSlackMb <= room)
-        return std::min(pool + kAutoStepMb, room);
+    {
+        excess.room_mb = std::max(excess.room_mb, room);
+        if (++excess.windows < kAutoLowerWindows)
+            return pool;
+        const uint64_t fits = excess.room_mb;
+        excess = AutoExcess();
+        return fits;
+    }
+    excess = AutoExcess();
+    if (in.starving && pool + kAutoStepMb <= room)
+        return pool + kAutoStepMb;
     return pool;
 }
 
@@ -680,7 +699,8 @@ uint64_t auto_tick(AutoState &a, const Config &c, uint64_t ceiling_mb, const Vid
 
     a.decided = a.samples != 0;
     if (a.decided)
-        a.pool_mb = auto_pool_mb({a.pool_mb, a.budget_mb, a.other_sum_mb / a.samples, c.auto_over_mb, ceiling_mb, a.starving});
+        a.pool_mb = auto_pool_mb({a.pool_mb, a.budget_mb, a.other_sum_mb / a.samples, c.auto_over_mb, ceiling_mb, a.starving},
+                                 a.excess);
     a.since = now;
     a.other_sum_mb = 0;
     a.samples = 0;
@@ -1134,7 +1154,7 @@ void draw_overlay(void * /*reshade::api::effect_runtime*/)
         if (ImGui::Checkbox("Automatic pool", &ui_cfg.auto_pool))
             changed = released = true;
         tooltip("The add-on sets the minimum pool by itself. It raises it while textures are blurred and the game's "
-                "VRAM budget has room, and lowers it when the game goes further over the budget than you allow below. "
+                "VRAM budget has room, and lowers it when the game stays further over the budget than you allow below. "
                 "Experimental: played on one 8 GB card only.");
         if (ui_cfg.auto_pool)
         {

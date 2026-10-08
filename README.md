@@ -117,13 +117,25 @@ A raised maximum is harmless: the game only grows the pool into VRAM that is act
 Since v1.4.0 the panel has an **Automatic pool** box, off by default. With it on, the add-on sets the pool floor by itself instead of holding one fixed value:
 
 - It asks Windows for the game's VRAM budget and usage, the way the game does, and works out the largest pool that keeps the game within the budget plus an allowance.
-- It lowers the floor to that at once, and raises it towards that in steps of 256 MB, only while textures are blurred. It decides every two seconds.
+- It raises the floor towards that in steps of 256 MB, only while textures are blurred. It decides every two seconds.
+- It lowers the floor only when it has been more than 256 MB over that for four decisions in a row, about eight seconds. The budget dips for a moment all the time, and every change of the floor unloads or reloads textures.
 - **Over budget** (`AutoOverBudgetMB`) is the allowance: how far over its budget the game may go. Windows pages that much to system RAM. Higher is sharper and can stutter. At 0 nothing is paged, and on a small card the result is close to the game without the add-on.
 - It starts from `MinPoolMB`, never goes under 256 MB, and stops at the maximum pool (the game's, or `MaxPoolMB`).
 
 The allowance starts at an eighth of the card's memory, between 256 and 1024 MB. On 8 GB that is 960 MB, about what the fixed 2048 MB floor ran at in the first test session.
 
-What it did in the one session it was played in (about 14 minutes, the 8 GB card under [Tested with](#tested-with)): the floor sat at 2048 MB or more for 84% of the time, with a median of 2304 MB, and the blur had a median of 1.3 mips. It also moved a lot, six to seven times a minute, because the budget Windows gives the game moves by a few hundred MB from one moment to the next. Each move down unloads textures and each move up loads them again. Sound cut out once in that session; whether the automatic pool had a part in that is not known, and one user reported the same with a fixed floor before this mode existed. If it bothers you, untick the box: the fixed floor is still the default.
+It was played for about an hour on the 8 GB card under [Tested with](#tested-with), in a first form that lowered the floor at once:
+
+- The floor had a median of 1728 MB. It was at 2048 MB or more for 84% of the first 14 minutes and for 22% of the whole hour, which went on into a heavier area.
+- The blur had a median of 2.35 mips, and the game was a median of 790 MB over its budget.
+- So with the default allowance it is not sharper than the fixed 2048 MB floor on that card. It holds the game about equally far over the budget everywhere, where a fixed floor goes further over in heavy places. Raise **Over budget** for a higher floor.
+- The floor moved 247 times, about four times a minute, because the budget Windows gives the game moves by a few hundred MB from one moment to the next.
+
+That is why the released version waits before it lowers the floor. Replaying that hour's readings through both rules offline, the released one moves the floor about a third as often and ends up at about the same median. It has not been played yet.
+
+Sound cut out once in that session. It has done that with the fixed floor too, before this mode existed, and one user reported the same, so it is not specific to the automatic pool. Whether the add-on causes it at all is not known.
+
+If the automatic pool bothers you, untick the box: the fixed floor is still the default.
 
 Switching the fix off with the key or the **Fix on** box stops the automatic pool too. It starts over from `MinPoolMB` when the fix is switched on again.
 
@@ -135,7 +147,7 @@ Lowering `BiasLimit` without a bigger pool doesn't sharpen anything, because the
 
 Game 0.564.208.5 with v1.4.0, v1.3.0, v1.2.0 and v1.1.1, and game 0.563.737.9 with the versions before those. ReShade 6.8.0, RTX 5060 Laptop 8 GB, alongside RenoDX and OptiScaler. That is the only setup the author has played it on, panel, on/off key and preset buttons included. On that card the add-on read 7899 MB and matched it to the 8 GB preset; writing a first ini for other card sizes is covered by the offline test only. What users report on other cards is in the preset table above.
 
-The automatic pool of v1.4.0 was played for about 14 minutes on that card and on no other. The released file differs from the played one in one thing: tooltips are broken into lines, because the longest one ran off the screen.
+The automatic pool of v1.4.0 was played for about an hour on that card and on no other. The released file differs from the played one in two things, both covered by the offline test only: the automatic pool waits about eight seconds before it lowers the floor, and tooltips are broken into lines, because the longest one ran off the screen.
 
 Game 0.564.478.0 has not been played. Its executable was checked with `build.bat test`: the add-on finds everything it needs there (fit-to-pool `exe+0x2ED93D0`, heap pointer `exe+0x5D0F2E8`, manager pointer `exe+0x5E08C30`), and the fit-to-pool code is the same as in 0.564.208.5.
 

@@ -98,17 +98,39 @@ bool check_automatic()
 
     // An 8 GB card: budget 7100 MB, the game holds 6000 MB besides textures, 960 MB over is allowed.
     // 2060 MB fit, which is 2048 in steps of 64.
-    expect("comes down at once to what fits", auto_pool_mb({3072, 7100, 6000, 960, 4096, true}), 2048);
-    expect("goes up a step at a time while textures are blurred", auto_pool_mb({1024, 7100, 6000, 960, 4096, true}), 1280);
-    expect("stops at what fits", auto_pool_mb({1920, 7100, 6000, 960, 4096, true}), 2048);
-    expect("stays put while textures are sharp", auto_pool_mb({1024, 7100, 6000, 960, 4096, false}), 1024);
-    expect("leaves a small difference alone", auto_pool_mb({2112, 7100, 6000, 960, 4096, true}), 2112);
-    expect("with nothing allowed over, follows the game's own rule", auto_pool_mb({2048, 7100, 6000, 0, 4096, true}), 1088);
-    expect("never goes under 256 MB", auto_pool_mb({2048, 7100, 9000, 0, 4096, true}), 256);
-    expect("never goes over the maximum pool", auto_pool_mb({1408, 16000, 3000, 1024, 1664, true}), 1664);
-    expect("comes down to a lowered maximum pool", auto_pool_mb({4096, 16000, 3000, 1024, 3072, false}), 3072);
+    AutoExcess none;
+    expect("goes up a step at a time while textures are blurred", auto_pool_mb({1024, 7100, 6000, 960, 4096, true}, none), 1280);
+    expect("goes up only when a whole step fits", auto_pool_mb({1920, 7100, 6000, 960, 4096, true}, none), 1920);
+    expect("stays put while textures are sharp", auto_pool_mb({1024, 7100, 6000, 960, 4096, false}, none), 1024);
+    expect("never goes over the maximum pool", auto_pool_mb({1408, 16000, 3000, 1024, 1664, true}, none), 1664);
+    expect("comes down to a lowered maximum pool at once", auto_pool_mb({4096, 16000, 3000, 1024, 3072, false}, none), 3072);
     // The 6 GB card of a user report: budget 5202 MB, 4393 MB used with about 1700 MB of textures.
-    expect("on a 6 GB card with room", auto_pool_mb({2048, 5202, 2693, 704, 4096, true}), 2304);
+    expect("on a 6 GB card with room", auto_pool_mb({2048, 5202, 2693, 704, 4096, true}, none), 2304);
+
+    // Over what fits: nothing happens until it has been so for kAutoLowerWindows windows in a row.
+    const auto windows = [](AutoInput in, AutoExcess &excess, uint32_t count) {
+        uint64_t pool = in.pool_mb;
+        for (uint32_t i = 0; i < count; ++i)
+            pool = auto_pool_mb(in, excess);
+        return pool;
+    };
+    AutoExcess excess;
+    expect("leaves a dip alone", windows({3072, 7100, 6000, 960, 4096, true}, excess, kAutoLowerWindows - 1), 3072);
+    expect("comes down when it lasts", auto_pool_mb({3072, 7100, 6000, 960, 4096, true}, excess), 2048);
+    ok = ok && excess.windows == 0;
+    windows({3072, 7100, 6000, 960, 4096, true}, excess, kAutoLowerWindows - 1);
+    expect("a window that fits", auto_pool_mb({3072, 7100, 5000, 960, 4096, true}, excess), 3072);
+    expect("starts the count again", windows({3072, 7100, 6000, 960, 4096, true}, excess, kAutoLowerWindows - 1), 3072);
+    // 1920, then 2112 MB fit in the windows before the last one: it comes down to the most of them.
+    excess = AutoExcess();
+    windows({3072, 7100, 6100, 960, 4096, true}, excess, kAutoLowerWindows - 2);
+    auto_pool_mb({3072, 7100, 5900, 960, 4096, true}, excess);
+    expect("comes down to the most that fitted meanwhile", auto_pool_mb({3072, 7100, 6000, 960, 4096, true}, excess), 2112);
+    excess = AutoExcess();
+    expect("leaves a small difference alone", windows({2304, 7100, 6000, 960, 4096, true}, excess, 2 * kAutoLowerWindows), 2304);
+    expect("with nothing allowed over, follows the game's own rule",
+           windows({2048, 7100, 6000, 0, 4096, true}, excess, kAutoLowerWindows), 1088);
+    expect("never goes under 256 MB", windows({2048, 7100, 9000, 0, 4096, true}, excess, kAutoLowerWindows), 256);
 
     const struct
     {
@@ -130,8 +152,14 @@ bool check_automatic()
     for (; now < 1000 + kAutoWindowMs; now += 250)
         pool = auto_tick(a, c, 4096, memory, game, now);
     expect("starts from MinPoolMB", pool, 2048);
+    const int window_ticks = static_cast<int>(kAutoWindowMs / 250);
     pool = auto_tick(a, c, 4096, memory, game, now);
-    expect("decides when the window is over", pool, 1536);
+    ok = ok && a.decided;
+    for (int i = 0; i < window_ticks * static_cast<int>(kAutoLowerWindows - 1) - 1; ++i)
+        pool = auto_tick(a, c, 4096, memory, game, now += 250);
+    expect("waits while it has not been over for long", pool, 2048);
+    pool = auto_tick(a, c, 4096, memory, game, now += 250);
+    expect("comes down after enough windows over", pool, 1536);
     ok = ok && a.decided;
 
     const VideoMemory other_card = {true, 7100 * kMiB, 100 * kMiB}; // less in use than the pool alone holds
