@@ -5,7 +5,7 @@ ReShade add-ons that stop textures in Remedy's Northlight games from going blurr
 | Game | Add-on | Download | Played on |
 |---|---|---|---|
 | Control Resonant | `CRStreamingFix.addon64` | [v1.4.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/v1.4.0) | game 0.564.208.5 and 0.563.737.9, see [Tested with](#tested-with) |
-| Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.0.0) | game 0.559.302.8, see [Alan Wake 2](#alan-wake-2) |
+| Alan Wake 2 | `AW2StreamingFix.addon64` | [v1.1.1](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.1.1) | game 0.559.302.8; newer build checked offline and confirmed working by a user, see [Alan Wake 2](#alan-wake-2) |
 | Control | `ControlStreamingFix.addon64` | [v1.0.0](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/control-v1.0.0) | game 0.0.518.2177 in DX12, see [Control](#control) |
 
 All three are built from one source. Control Resonant and Alan Wake 2 work the same way. Control has an older streamer, and its own section. The rest of this page describes the Control Resonant add-on. For Alan Wake 2, read `AW2StreamingFix` for `CRStreamingFix` and `AlanWake2.exe` for `CONTROLResonant.exe`.
@@ -157,9 +157,11 @@ On game 0.564 use v1.1.1 or later. Older versions still apply the fix there, but
 
 Alan Wake 2 runs the same texture streamer with the same numbers: a 100 MiB floor, ceilings of 1664 MiB, 3 GiB and 4 GiB from Texture Resolution, and the same fit-to-pool controller. `AW2StreamingFix.addon64` is this add-on built for `AlanWake2.exe`. Install and settings are as above, with `AW2StreamingFix` in the file names: put `AW2StreamingFix.addon64` next to `AlanWake2.exe`.
 
-For game **0.564.904.9**, use **AW2StreamingFix v1.1.1**, built from this source. The v1.0.0 download above recognizes the older executable. The newer game's controller has a different instruction layout; v1.1.1 recognizes both layouts and still requires exactly one match before changing anything.
+For game **0.564.904.9**, use [**AW2StreamingFix v1.1.1**](https://github.com/Gabarsolon/remedy-texture-fix/releases/tag/aw2-v1.1.1) or later. The newer game's controller has a different instruction layout; v1.1.1 recognizes both layouts and still requires exactly one match before changing anything. Neither add-on uses a game-version whitelist: a later game build can work without an add-on update while its code still matches.
 
-Game 0.564.904.9 was checked offline from `AlanWake2.exe` alone: no game launch or data files are needed. The add-on finds fit-to-pool at `exe+0x21D7070`, the heap pointer at `exe+0x3B6F2E0`, the manager pointer at `exe+0x38A6F20`, and the pool-use and VRAM-left stats fields. `build.bat test "path\to\AlanWake2.exe"` checks these against the addresses and offsets found in disassembly. The offline lifecycle test also checks applying the settings with the new layout, and rejecting ambiguous signatures or an unexpected controller body. This build has not been tested in gameplay.
+Game 0.564.904.9 was checked offline from `AlanWake2.exe` alone: no game launch or data files are needed. The add-on finds fit-to-pool at `exe+0x21D7070`, the heap pointer at `exe+0x3B6F2E0`, the manager pointer at `exe+0x38A6F20`, and the pool-use and VRAM-left stats fields. `build.bat test "path\to\AlanWake2.exe"` checks these against the addresses and offsets found in disassembly. The offline lifecycle test also checks applying the settings with the new layout, and rejecting ambiguous signatures or an unexpected controller body. [The reporter in issue #1 confirmed v1.1.1 is working](https://github.com/Gabarsolon/remedy-texture-fix/issues/1#issuecomment-6401075632) and said they would continue testing during gameplay. The author has not tested gameplay on this newer build.
+
+The Alan Wake 2 release also includes the on/off key, graphics-card memory presets and experimental automatic pool described above. When updating, replace the add-on and keep `AW2StreamingFix.ini` to retain your settings.
 
 One test session showed the pool driving the blur directly. It ran on an 8 GB card at 1440p from a 720p render, with path tracing, ray reconstruction and frame generation on and Texture Resolution on High. The pool was moved with the add-on's sliders while standing in one spot:
 
@@ -171,7 +173,7 @@ One test session showed the pool driving the blur directly. It ran on an 8 GB ca
 
 Five minutes in, the game by itself had 1.4 GB left for textures, and that number was still falling.
 
-Tested with game 0.559.302.8 and ReShade 6.8.0 on an RTX 5060 Laptop 8 GB, with no other mods. That is the only setup it has been played on, and the session was short. If it misbehaves for you, please open an issue with `AW2StreamingFix.log` attached.
+The author's gameplay test used game 0.559.302.8 and ReShade 6.8.0 on an RTX 5060 Laptop 8 GB, with no other mods, and the session was short. If it misbehaves for you, please open an issue with `AW2StreamingFix.log` attached.
 
 ## Control
 
