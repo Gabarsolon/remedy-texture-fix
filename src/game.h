@@ -13,8 +13,8 @@
 #define CRSF_NAME "AW2StreamingFix"
 #define CRSF_GAME "Alan Wake 2"
 #define CRSF_EXE "AlanWake2.exe"
-#define CRSF_VERSION "1.1.0"
-#define CRSF_VERSION_NUM 1, 1, 0, 0
+#define CRSF_VERSION "1.1.1"
+#define CRSF_VERSION_NUM 1, 1, 1, 0
 #define CRSF_BACKEND_HEAP
 #elif defined(CRSF_GAME_CONTROL)
 #define CRSF_NAME "ControlStreamingFix"
@@ -57,7 +57,7 @@ struct GameLayout
 };
 
 #if defined(CRSF_GAME_AW2)
-constexpr GameLayout kLayout = {0x170, 0x08, 0x10}; // AlanWake2.exe 0.559.302.8
+constexpr GameLayout kLayout = {0x170, 0x08, 0x10}; // AlanWake2.exe 0.559.302.8 and 0.564.904.9
 #else
 constexpr GameLayout kLayout = {0x140, 0x00, 0x08}; // CONTROLResonant.exe 0.563.737.9 and 0.564.208.5
 #endif

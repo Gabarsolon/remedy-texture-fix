@@ -157,6 +157,10 @@ On game 0.564 use v1.1.1 or later. Older versions still apply the fix there, but
 
 Alan Wake 2 runs the same texture streamer with the same numbers: a 100 MiB floor, ceilings of 1664 MiB, 3 GiB and 4 GiB from Texture Resolution, and the same fit-to-pool controller. `AW2StreamingFix.addon64` is this add-on built for `AlanWake2.exe`. Install and settings are as above, with `AW2StreamingFix` in the file names: put `AW2StreamingFix.addon64` next to `AlanWake2.exe`.
 
+For game **0.564.904.9**, use **AW2StreamingFix v1.1.1**, built from this source. The v1.0.0 download above recognizes the older executable. The newer game's controller has a different instruction layout; v1.1.1 recognizes both layouts and still requires exactly one match before changing anything.
+
+Game 0.564.904.9 was checked offline from `AlanWake2.exe` alone: no game launch or data files are needed. The add-on finds fit-to-pool at `exe+0x21D7070`, the heap pointer at `exe+0x3B6F2E0`, the manager pointer at `exe+0x38A6F20`, and the pool-use and VRAM-left stats fields. `build.bat test "path\to\AlanWake2.exe"` checks these against the addresses and offsets found in disassembly. The offline lifecycle test also checks applying the settings with the new layout, and rejecting ambiguous signatures or an unexpected controller body. This build has not been tested in gameplay.
+
 One test session showed the pool driving the blur directly. It ran on an 8 GB card at 1440p from a 720p render, with path tracing, ray reconstruction and frame generation on and Texture Resolution on High. The pool was moved with the add-on's sliders while standing in one spot:
 
 | Pool | Textures loaded | Blur |

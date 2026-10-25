@@ -170,6 +170,26 @@ void set_ini(unsigned min_mb, unsigned max_mb, const char *bias)
                   bias);
     replace_ini(buf);
 }
+
+#if defined(CRSF_GAME_AW2)
+// Controller bytes from AlanWake2.exe 0.564.904.9, with references redirected to the fake objects.
+void use_current_aw2_controller()
+{
+    std::memset(g_code, 0xCC, 0x180);
+    put(0, {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57,
+            0x48, 0x83, 0xEC, 0x60, 0xC5, 0xF8, 0x29, 0x74, 0x24, 0x50, 0xC5, 0xF8, 0x29, 0x7C, 0x24, 0x40,
+            0x48, 0x8B, 0xF1, 0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0x8B, 0x08, 0xC5, 0xF0, 0x57, 0xC9});
+    rel32(0x26, &g_heap_ptr);
+    put(0x5A, {0xC5, 0xDA, 0x5C, 0x05});
+    rel32(0x5E, &g_high);
+    put(0x95, {0xC5, 0xDA, 0x5C, 0x05});
+    rel32(0x99, &g_low);
+    put(0xD0, {0xC5, 0xC2, 0x5C, 0x05});
+    rel32(0xD4, &g_rate);
+    put(0xF3, {0xC5, 0xCA, 0x5D, 0x35});
+    rel32(0xF7, &g_bias_limit);
+}
+#endif
 } // namespace
 
 int wmain()
@@ -474,7 +494,51 @@ int wmain()
     FreeLibrary(m);
     check(!loaded(), "unloads cleanly");
 
-    std::printf("15. Exit with the add-on loaded\n");
+#if defined(CRSF_GAME_AW2)
+    std::printf("15. Alan Wake 2 0.564.904.9 controller\n");
+    build_fake_game();
+    // Preserve the old signature for the ambiguity check below. Its relocated operands are never read.
+    std::memcpy(g_code + 0x1000, g_code, 0x180);
+    std::memset(g_code + 0x1000, 0xCC, 1);
+    use_current_aw2_controller();
+    g_heap_ptr = reinterpret_cast<uint64_t>(&g_heap_obj[0]);
+    g_heap_obj[0] = 1024 * MiB;
+    g_heap_obj[1] = 100 * MiB;
+    set_ini(2304, 4096, "1");
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    frames();
+    check(g_heap_obj[0] == 2304 * MiB && g_heap_obj[1] == 2304 * MiB && g_heap_obj[2] == 4096 * MiB,
+          "new controller: pool floor and ceiling apply at the resolved heap");
+    check(g_bias_limit == 1.0f, "new controller: bias limit uses its changed instruction offset");
+    check(drew("Blur:") && drew("Textures want") && drew("MB used"), "new controller: manager and stats still found");
+    if (m)
+        FreeLibrary(m);
+
+    std::printf("16. Both Alan Wake 2 controller signatures present\n");
+    g_code[0x1000] = 0x48;
+    g_heap_obj[1] = 100 * MiB;
+    g_bias_limit = 10.0f;
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    check(g_heap_obj[1] == 100 * MiB && g_bias_limit == 10.0f, "ambiguous controllers: nothing is written");
+    check(log_contains("signature matched 2 times"), "ambiguity is rejected across both signatures");
+    if (m)
+        FreeLibrary(m);
+
+    std::printf("17. New Alan Wake 2 controller with an unexpected body\n");
+    g_code[0x1000] = 0xCC;
+    g_code[0xF3] ^= 0xFF;
+    m = LoadLibraryW(g_addon.c_str());
+    Sleep(1600);
+    check(g_heap_obj[1] == 100 * MiB && g_bias_limit == 10.0f, "changed body: nothing is written");
+    check(log_contains("fit-to-pool body looks different"), "the new controller's body is validated before any write");
+    if (m)
+        FreeLibrary(m);
+    g_code[0xF3] ^= 0xFF;
+#endif
+
+    std::printf("Final. Exit with the add-on loaded\n");
     m = LoadLibraryW(g_addon.c_str());
     Sleep(1300);
     check(m != nullptr, "loaded; the process now exits without unloading it");

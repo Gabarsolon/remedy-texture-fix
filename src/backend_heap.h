@@ -202,22 +202,29 @@ bool locate_tweakables(uintptr_t f, uintptr_t high, uintptr_t low, uintptr_t rat
 
 #if defined(CRSF_GAME_AW2)
 
-// Alan Wake 2 (AlanWake2.exe 0.559.302.8). Tweakable names are stripped from this build and the
-// accessors are inlined, so the controller loads the heap pointer directly.
+// Alan Wake 2 (AlanWake2.exe 0.559.302.8 and 0.564.904.9). Tweakable names are stripped and the
+// accessors are inlined, so the controller loads the heap pointer directly. The newer compiler build
+// saves RSI on the stack instead of pushing it, and uses a shorter sequence before the bias clamp.
 bool locate_game(const Section &text, Targets &t, uintptr_t &f)
 {
     //   ... ; mov rsi,rcx ; mov rax,[rip+heap] ; mov rcx,[rax] ; vxorps xmm1,xmm1,xmm1
-    const auto fit = scan(text, "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 60 C5 F8 29 74 24 50 "
-                                "C5 F8 29 7C 24 40 48 8B F1 48 8B 05 ?? ?? ?? ?? 48 8B 08 C5 F0 57 C9");
-    if (fit.size() != 1)
+    const auto original = scan(text, "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 60 C5 F8 29 74 24 50 "
+                                     "C5 F8 29 7C 24 40 48 8B F1 48 8B 05 ?? ?? ?? ?? 48 8B 08 C5 F0 57 C9");
+    const auto current = scan(text, "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 60 "
+                                    "C5 F8 29 74 24 50 C5 F8 29 7C 24 40 48 8B F1 48 8B 05 ?? ?? ?? ?? "
+                                    "48 8B 08 C5 F0 57 C9");
+    const size_t matches = original.size() + current.size();
+    if (matches != 1)
     {
         log_line("ERROR: fit-to-pool signature matched %zu times (expected 1). Unsupported game version, doing nothing.",
-                 fit.size());
+                 matches);
         return false;
     }
-    f = fit[0];
-    t.heap_ptr = rel32_target(f + 0x24);
-    if (!locate_tweakables(f, 0x58, 0x93, 0xCE, 0xF5, t))
+    const bool newer = !current.empty();
+    f = newer ? current[0] : original[0];
+    t.heap_ptr = rel32_target(f + (newer ? 0x26 : 0x24));
+    if (!(newer ? locate_tweakables(f, 0x5A, 0x95, 0xD0, 0xF3, t)
+                : locate_tweakables(f, 0x58, 0x93, 0xCE, 0xF5, t)))
         return false;
 
     // Texture streaming manager: the frame code starts the streaming update with
